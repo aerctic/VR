@@ -1,0 +1,142 @@
+#version 450
+// Turns one flat game frame + its depth buffer into a side-by-side stereo
+// pair (depth-image-based rendering). Output is linear RGB in an RGBA16F
+// image: left eye in [0, W), right eye in [W, 2W). In mono mode only the
+// left half is written.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0) uniform sampler2D src_color;
+layout(binding = 1, std430) readonly buffer DepthBuf { uint texels[]; } depth;
+layout(binding = 2, rgba16f) uniform writeonly image2D dst;
+layout(binding = 3, std430) buffer Stats {
+    uint zero_count;  // sampled texels with raw depth == 0
+    uint one_count;   // sampled texels with raw depth == 1
+    uint samples;
+} stats;
+
+const uint FLAG_STEREO = 1u;
+const uint FLAG_REVERSED = 2u;
+const uint FLAG_FLIP_Y = 4u;
+const uint FLAG_SRGB_DECODE = 8u;
+const uint FLAG_SHOW_DEPTH = 16u;
+const uint FLAG_HAS_DEPTH = 32u;
+
+layout(push_constant) uniform Params {
+    uvec2 size;         // per-eye output size == source color size
+    uvec2 depth_size;
+    uint depth_format;  // 1 = D16, 2 = X8D24, 3 = D32F
+    uint flags;
+    float separation;   // max parallax as a fraction of the image width
+    float convergence;  // linearized depth that sits on the screen plane
+    float popout;       // max negative parallax as a fraction of separation
+    float far_plane;    // depth linearization constant
+    int steps;          // search steps per pixel
+} pc;
+
+float raw_depth(vec2 uv) {
+    uv = clamp(uv, vec2(0.0), vec2(1.0));
+    if ((pc.flags & FLAG_FLIP_Y) != 0u) uv.y = 1.0 - uv.y;
+    uvec2 p = min(uvec2(uv * vec2(pc.depth_size)), pc.depth_size - uvec2(1));
+    uint i = p.y * pc.depth_size.x + p.x;
+    if (pc.depth_format == 1u) {
+        uint w = depth.texels[i >> 1];
+        return float((i & 1u) == 0u ? (w & 0xFFFFu) : (w >> 16)) / 65535.0;
+    }
+    if (pc.depth_format == 2u) return float(depth.texels[i] & 0xFFFFFFu) / 16777215.0;
+    return clamp(uintBitsToFloat(depth.texels[i]), 0.0, 1.0);
+}
+
+// 0 = near, 1 = far, roughly linear in view distance.
+float linear_depth(vec2 uv) {
+    float d = raw_depth(uv);
+    if ((pc.flags & FLAG_REVERSED) != 0u) d = 1.0 - d;
+    return d / (pc.far_plane - d * (pc.far_plane - 1.0));
+}
+
+// Horizontal parallax in uv units. Positive = behind the screen plane.
+float parallax(vec2 uv) {
+    float z = max(linear_depth(uv), 1e-5);
+    float p = pc.separation * (1.0 - pc.convergence / z);
+    return clamp(p, -pc.separation * pc.popout, pc.separation);
+}
+
+vec3 srgb_to_linear(vec3 c) {
+    return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), greaterThan(c, vec3(0.04045)));
+}
+
+void main() {
+    uvec3 gid = gl_GlobalInvocationID;
+    if (gid.x >= pc.size.x || gid.y >= pc.size.y) return;
+    const bool stereo = (pc.flags & FLAG_STEREO) != 0u && (pc.flags & FLAG_HAS_DEPTH) != 0u;
+    const bool has_depth = (pc.flags & FLAG_HAS_DEPTH) != 0u;
+    uint eye = gid.z;
+    vec2 uv = (vec2(gid.xy) + 0.5) / vec2(pc.size);
+
+    // Sparse samples to auto-detect reversed-Z (sky/clear value is 0 instead of 1).
+    if (has_depth && eye == 0u && (gid.x & 15u) == 0u && (gid.y & 15u) == 0u) {
+        float r = raw_depth(uv);
+        if (r <= 0.0) atomicAdd(stats.zero_count, 1u);
+        else if (r >= 1.0) atomicAdd(stats.one_count, 1u);
+        atomicAdd(stats.samples, 1u);
+    }
+
+    vec2 src = uv;
+    if (stereo) {
+        // Backward mapping. A source texel at s is seen by the left eye at
+        // s - p(s)/2 and by the right eye at s + p(s)/2. Find every s that
+        // lands on this pixel, i.e. roots of f(s) = s - sgn * p(s) / 2 - x,
+        // and keep the nearest one (smallest parallax) so foreground objects
+        // correctly occlude the background.
+        float sgn = eye == 0u ? 1.0 : -1.0;
+        float lo = uv.x - sgn * 0.5 * pc.separation * pc.popout;
+        float hi = uv.x + sgn * 0.5 * pc.separation;
+        float step_len = abs(hi - lo) / float(pc.steps);
+        float prev_s = lo;
+        float prev_p = parallax(vec2(lo, uv.y));
+        float prev_f = prev_s - sgn * 0.5 * prev_p - uv.x;
+        float best_s = uv.x, best_p = 1e9;
+        float fallback_s = uv.x, fallback_err = 1e9;
+        float hole_s = uv.x;
+        bool hole = false;
+        for (int i = 1; i <= pc.steps; ++i) {
+            float s = mix(lo, hi, float(i) / float(pc.steps));
+            float p = parallax(vec2(s, uv.y));
+            float f = s - sgn * 0.5 * p - uv.x;
+            if (abs(f) < fallback_err) {
+                fallback_err = abs(f);
+                fallback_s = s;
+            }
+            if ((f <= 0.0) != (prev_f <= 0.0)) {
+                float sc = mix(prev_s, s, prev_f / (prev_f - f));
+                float pc_ = parallax(vec2(sc, uv.y));
+                // Reject sign flips caused by depth discontinuities rather than real roots.
+                if (abs(sc - sgn * 0.5 * pc_ - uv.x) <= step_len) {
+                    if (pc_ < best_p) {
+                        best_p = pc_;
+                        best_s = sc;
+                    }
+                } else if (!hole) {
+                    // Sign flip across a depth edge without a root: this pixel
+                    // looks into a disoccluded hole. Fill it from the far side.
+                    hole = true;
+                    hole_s = p > prev_p ? s : prev_s;
+                }
+            }
+            prev_s = s;
+            prev_p = p;
+            prev_f = f;
+        }
+        src.x = best_p < 1e9 ? best_s : (hole ? hole_s : fallback_s);
+    }
+
+    vec3 c;
+    if ((pc.flags & FLAG_SHOW_DEPTH) != 0u && has_depth) {
+        c = vec3(pow(linear_depth(src), 0.25));
+    } else {
+        c = textureLod(src_color, src, 0.0).rgb;
+        if ((pc.flags & FLAG_SRGB_DECODE) != 0u) c = srgb_to_linear(clamp(c, 0.0, 1.0));
+        c = clamp(c, vec3(0.0), vec3(1.0));
+    }
+    imageStore(dst, ivec2(gid.x + eye * pc.size.x, gid.y), vec4(c, 1.0));
+}
