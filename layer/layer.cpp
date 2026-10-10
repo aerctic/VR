@@ -18,6 +18,7 @@
 #include <cstring>
 #include <string>
 
+#include "analyzer.h"
 #include "capture.h"
 #include "log.h"
 
@@ -259,6 +260,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(VkPhysicalDevice phys, const 
             VK_API_VERSION_MAJOR(api), VK_API_VERSION_MINOR(api), dev->external_memory_fd ? "on" : "off",
             dev->depth_capture ? "on" : "off");
 
+    if (env_flag("VRLAYER_ANALYZE", true)) dev->analyzer = std::make_unique<Analyzer>();
     dev->capture = std::make_unique<Capture>(dev);
 
     std::lock_guard<std::mutex> l(g_mtx);
@@ -283,6 +285,7 @@ static VKAPI_ATTR void VKAPI_CALL DestroyDevice(VkDevice device, const VkAllocat
         g_device_epoch.fetch_add(1, std::memory_order_release);
     }
     dev->capture.reset();
+    dev->analyzer.reset();
     for (auto& [sc, data] : dev->swapchains)
         for (VkSemaphore s : data.copy_done)
             if (s) dev->d.DestroySemaphore(device, s, nullptr);
@@ -432,6 +435,18 @@ static VKAPI_ATTR VkResult VKAPI_CALL QueuePresentKHR(VkQueue queue, const VkPre
         if (dev->depth_copied_since_present) dev->frames_since_depth_copy = 0;
         else if (dev->frames_since_depth_copy < 1000) dev->frames_since_depth_copy++;
         dev->depth_copied_since_present = false;
+    }
+
+    if (dev->analyzer && info->swapchainCount > 0) {
+        VkExtent2D extent{};
+        bool depth;
+        {
+            std::lock_guard<std::mutex> l(dev->mtx);
+            auto it = dev->swapchains.find(info->pSwapchains[0]);
+            if (it != dev->swapchains.end()) extent = it->second.extent;
+            depth = dev->selected_depth != VK_NULL_HANDLE;
+        }
+        if (extent.width && dev->analyzer->on_present(extent, depth)) dev->capture->report_analysis();
     }
 
     VkSemaphore wait = VK_NULL_HANDLE;
@@ -833,66 +848,169 @@ static VKAPI_ATTR void VKAPI_CALL CmdExecuteCommands(VkCommandBuffer cb, uint32_
 }
 
 // ---------------------------------------------------------------------------
+// Camera analysis hooks (only exposed when the analyzer is enabled)
+// ---------------------------------------------------------------------------
+
+static VKAPI_ATTR VkResult VKAPI_CALL AllocateMemory(VkDevice device, const VkMemoryAllocateInfo* ai,
+                                                     const VkAllocationCallbacks* alloc, VkDeviceMemory* mem) {
+    DeviceData* dev = dev_of(device);
+    VkResult r = dev->d.AllocateMemory(device, ai, alloc, mem);
+    if (r == VK_SUCCESS && ai->memoryTypeIndex < dev->mem_props.memoryTypeCount &&
+        (dev->mem_props.memoryTypes[ai->memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
+        dev->analyzer->on_allocate(*mem, ai->allocationSize);
+    return r;
+}
+
+static VKAPI_ATTR void VKAPI_CALL FreeMemory(VkDevice device, VkDeviceMemory mem, const VkAllocationCallbacks* alloc) {
+    DeviceData* dev = dev_of(device);
+    std::lock_guard<std::mutex> l(dev->analyzer->region_lock());
+    if (mem) dev->analyzer->on_free(mem);
+    dev->d.FreeMemory(device, mem, alloc);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL MapMemory(VkDevice device, VkDeviceMemory mem, VkDeviceSize offset,
+                                                VkDeviceSize size, VkMemoryMapFlags flags, void** data) {
+    DeviceData* dev = dev_of(device);
+    VkResult r = dev->d.MapMemory(device, mem, offset, size, flags, data);
+    if (r == VK_SUCCESS) dev->analyzer->on_map(mem, offset, size, *data);
+    return r;
+}
+
+static VKAPI_ATTR void VKAPI_CALL UnmapMemory(VkDevice device, VkDeviceMemory mem) {
+    DeviceData* dev = dev_of(device);
+    std::lock_guard<std::mutex> l(dev->analyzer->region_lock());
+    dev->analyzer->on_unmap(mem);
+    dev->d.UnmapMemory(device, mem);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL MapMemory2KHR(VkDevice device, const VkMemoryMapInfoKHR* info, void** data) {
+    DeviceData* dev = dev_of(device);
+    VkResult r = dev->d.MapMemory2KHR(device, info, data);
+    if (r == VK_SUCCESS) dev->analyzer->on_map(info->memory, info->offset, info->size, *data);
+    return r;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL UnmapMemory2KHR(VkDevice device, const VkMemoryUnmapInfoKHR* info) {
+    DeviceData* dev = dev_of(device);
+    std::lock_guard<std::mutex> l(dev->analyzer->region_lock());
+    dev->analyzer->on_unmap(info->memory);
+    return dev->d.UnmapMemory2KHR(device, info);
+}
+
+static VKAPI_ATTR void VKAPI_CALL CmdPushConstants(VkCommandBuffer cb, VkPipelineLayout layout, VkShaderStageFlags stages,
+                                                   uint32_t offset, uint32_t size, const void* values) {
+    DeviceData* dev = dev_of(cb);
+    std::vector<uint8_t> patched;
+    if (dev->analyzer->on_inline_data(values, size, &patched))
+        dev->d.CmdPushConstants(cb, layout, stages, offset, size, patched.data());
+    else
+        dev->d.CmdPushConstants(cb, layout, stages, offset, size, values);
+}
+
+static VKAPI_ATTR void VKAPI_CALL CmdUpdateBuffer(VkCommandBuffer cb, VkBuffer buffer, VkDeviceSize offset,
+                                                  VkDeviceSize size, const void* data) {
+    DeviceData* dev = dev_of(cb);
+    std::vector<uint8_t> patched;
+    if (dev->analyzer->on_inline_data(data, uint32_t(size), &patched))
+        dev->d.CmdUpdateBuffer(cb, buffer, offset, size, patched.data());
+    else
+        dev->d.CmdUpdateBuffer(cb, buffer, offset, size, data);
+}
+
+static VKAPI_ATTR void VKAPI_CALL CmdSetViewport(VkCommandBuffer cb, uint32_t first, uint32_t n, const VkViewport* v) {
+    DeviceData* dev = dev_of(cb);
+    dev->analyzer->on_viewport(v, n);
+    dev->d.CmdSetViewport(cb, first, n, v);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL QueueSubmit(VkQueue queue, uint32_t n, const VkSubmitInfo* submits, VkFence fence) {
+    DeviceData* dev = dev_of(queue);
+    dev->analyzer->before_submit();
+    return dev->d.QueueSubmit(queue, n, submits, fence);
+}
+
+template <PFN_vkQueueSubmit2 DeviceDispatch::*Next>
+static VKAPI_ATTR VkResult VKAPI_CALL QueueSubmit2(VkQueue queue, uint32_t n, const VkSubmitInfo2* submits,
+                                                   VkFence fence) {
+    DeviceData* dev = dev_of(queue);
+    dev->analyzer->before_submit();
+    return (dev->d.*Next)(queue, n, submits, fence);
+}
+
+// ---------------------------------------------------------------------------
 // Proc address resolution
 // ---------------------------------------------------------------------------
 
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL GetDeviceProcAddr(VkDevice device, const char* name);
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL GetInstanceProcAddr(VkInstance instance, const char* name);
 
+enum Needs { kAlways = 0, kDepth = 1, kAnalyze = 2 };
 struct Hook {
     const char* name;
     PFN_vkVoidFunction fn;
-    bool depth_only;  // only needed for depth tracking
+    int needs;  // only exposed when that feature is enabled
 };
 
-#define HOOK(name, fn, depth) {"vk" name, reinterpret_cast<PFN_vkVoidFunction>(fn), depth}
+#define HOOK(name, fn, needs) {"vk" name, reinterpret_cast<PFN_vkVoidFunction>(fn), needs}
 static const Hook kDeviceHooks[] = {
-    HOOK("GetDeviceProcAddr", GetDeviceProcAddr, false),
-    HOOK("DestroyDevice", DestroyDevice, false),
-    HOOK("GetDeviceQueue", GetDeviceQueue, false),
-    HOOK("GetDeviceQueue2", GetDeviceQueue2, false),
-    HOOK("CreateSwapchainKHR", CreateSwapchainKHR, false),
-    HOOK("DestroySwapchainKHR", DestroySwapchainKHR, false),
-    HOOK("QueuePresentKHR", QueuePresentKHR, false),
-    HOOK("CreateImage", CreateImage, true),
-    HOOK("DestroyImage", DestroyImage, true),
-    HOOK("CreateImageView", CreateImageView, true),
-    HOOK("DestroyImageView", DestroyImageView, true),
-    HOOK("CreateRenderPass", CreateRenderPass, true),
-    HOOK("CreateRenderPass2", CreateRenderPass2<&DeviceDispatch::CreateRenderPass2>, true),
-    HOOK("CreateRenderPass2KHR", CreateRenderPass2<&DeviceDispatch::CreateRenderPass2KHR>, true),
-    HOOK("DestroyRenderPass", DestroyRenderPass, true),
-    HOOK("CreateFramebuffer", CreateFramebuffer, true),
-    HOOK("DestroyFramebuffer", DestroyFramebuffer, true),
-    HOOK("AllocateCommandBuffers", AllocateCommandBuffers, true),
-    HOOK("FreeCommandBuffers", FreeCommandBuffers, true),
-    HOOK("DestroyCommandPool", DestroyCommandPool, true),
-    HOOK("BeginCommandBuffer", BeginCommandBuffer, true),
-    HOOK("CmdBeginRenderPass", CmdBeginRenderPass, true),
-    HOOK("CmdBeginRenderPass2", CmdBeginRenderPass2<&DeviceDispatch::CmdBeginRenderPass2>, true),
-    HOOK("CmdBeginRenderPass2KHR", CmdBeginRenderPass2<&DeviceDispatch::CmdBeginRenderPass2KHR>, true),
-    HOOK("CmdEndRenderPass", CmdEndRenderPass, true),
-    HOOK("CmdEndRenderPass2", CmdEndRenderPass2<&DeviceDispatch::CmdEndRenderPass2>, true),
-    HOOK("CmdEndRenderPass2KHR", CmdEndRenderPass2<&DeviceDispatch::CmdEndRenderPass2KHR>, true),
-    HOOK("CmdBeginRendering", CmdBeginRendering<&DeviceDispatch::CmdBeginRendering>, true),
-    HOOK("CmdBeginRenderingKHR", CmdBeginRendering<&DeviceDispatch::CmdBeginRenderingKHR>, true),
-    HOOK("CmdEndRendering", CmdEndRendering<&DeviceDispatch::CmdEndRendering>, true),
-    HOOK("CmdEndRenderingKHR", CmdEndRendering<&DeviceDispatch::CmdEndRenderingKHR>, true),
-    HOOK("CmdDraw", CmdDraw, true),
-    HOOK("CmdDrawIndexed", CmdDrawIndexed, true),
-    HOOK("CmdDrawIndirect", CmdDrawIndirect, true),
-    HOOK("CmdDrawIndexedIndirect", CmdDrawIndexedIndirect, true),
-    HOOK("CmdDrawIndirectCount", CmdDrawIndirectCount, true),
-    HOOK("CmdDrawIndirectCountKHR", CmdDrawIndirectCount, true),
-    HOOK("CmdDrawIndexedIndirectCount", CmdDrawIndexedIndirectCount, true),
-    HOOK("CmdDrawIndexedIndirectCountKHR", CmdDrawIndexedIndirectCount, true),
-    HOOK("CmdExecuteCommands", CmdExecuteCommands, true),
+    HOOK("GetDeviceProcAddr", GetDeviceProcAddr, kAlways),
+    HOOK("DestroyDevice", DestroyDevice, kAlways),
+    HOOK("GetDeviceQueue", GetDeviceQueue, kAlways),
+    HOOK("GetDeviceQueue2", GetDeviceQueue2, kAlways),
+    HOOK("CreateSwapchainKHR", CreateSwapchainKHR, kAlways),
+    HOOK("DestroySwapchainKHR", DestroySwapchainKHR, kAlways),
+    HOOK("QueuePresentKHR", QueuePresentKHR, kAlways),
+    HOOK("CreateImage", CreateImage, kDepth),
+    HOOK("DestroyImage", DestroyImage, kDepth),
+    HOOK("CreateImageView", CreateImageView, kDepth),
+    HOOK("DestroyImageView", DestroyImageView, kDepth),
+    HOOK("CreateRenderPass", CreateRenderPass, kDepth),
+    HOOK("CreateRenderPass2", CreateRenderPass2<&DeviceDispatch::CreateRenderPass2>, kDepth),
+    HOOK("CreateRenderPass2KHR", CreateRenderPass2<&DeviceDispatch::CreateRenderPass2KHR>, kDepth),
+    HOOK("DestroyRenderPass", DestroyRenderPass, kDepth),
+    HOOK("CreateFramebuffer", CreateFramebuffer, kDepth),
+    HOOK("DestroyFramebuffer", DestroyFramebuffer, kDepth),
+    HOOK("AllocateCommandBuffers", AllocateCommandBuffers, kDepth),
+    HOOK("FreeCommandBuffers", FreeCommandBuffers, kDepth),
+    HOOK("DestroyCommandPool", DestroyCommandPool, kDepth),
+    HOOK("BeginCommandBuffer", BeginCommandBuffer, kDepth),
+    HOOK("CmdBeginRenderPass", CmdBeginRenderPass, kDepth),
+    HOOK("CmdBeginRenderPass2", CmdBeginRenderPass2<&DeviceDispatch::CmdBeginRenderPass2>, kDepth),
+    HOOK("CmdBeginRenderPass2KHR", CmdBeginRenderPass2<&DeviceDispatch::CmdBeginRenderPass2KHR>, kDepth),
+    HOOK("CmdEndRenderPass", CmdEndRenderPass, kDepth),
+    HOOK("CmdEndRenderPass2", CmdEndRenderPass2<&DeviceDispatch::CmdEndRenderPass2>, kDepth),
+    HOOK("CmdEndRenderPass2KHR", CmdEndRenderPass2<&DeviceDispatch::CmdEndRenderPass2KHR>, kDepth),
+    HOOK("CmdBeginRendering", CmdBeginRendering<&DeviceDispatch::CmdBeginRendering>, kDepth),
+    HOOK("CmdBeginRenderingKHR", CmdBeginRendering<&DeviceDispatch::CmdBeginRenderingKHR>, kDepth),
+    HOOK("CmdEndRendering", CmdEndRendering<&DeviceDispatch::CmdEndRendering>, kDepth),
+    HOOK("CmdEndRenderingKHR", CmdEndRendering<&DeviceDispatch::CmdEndRenderingKHR>, kDepth),
+    HOOK("CmdDraw", CmdDraw, kDepth),
+    HOOK("CmdDrawIndexed", CmdDrawIndexed, kDepth),
+    HOOK("CmdDrawIndirect", CmdDrawIndirect, kDepth),
+    HOOK("CmdDrawIndexedIndirect", CmdDrawIndexedIndirect, kDepth),
+    HOOK("CmdDrawIndirectCount", CmdDrawIndirectCount, kDepth),
+    HOOK("CmdDrawIndirectCountKHR", CmdDrawIndirectCount, kDepth),
+    HOOK("CmdDrawIndexedIndirectCount", CmdDrawIndexedIndirectCount, kDepth),
+    HOOK("CmdDrawIndexedIndirectCountKHR", CmdDrawIndexedIndirectCount, kDepth),
+    HOOK("CmdExecuteCommands", CmdExecuteCommands, kDepth),
+    HOOK("AllocateMemory", AllocateMemory, kAnalyze),
+    HOOK("FreeMemory", FreeMemory, kAnalyze),
+    HOOK("MapMemory", MapMemory, kAnalyze),
+    HOOK("UnmapMemory", UnmapMemory, kAnalyze),
+    HOOK("MapMemory2KHR", MapMemory2KHR, kAnalyze),
+    HOOK("UnmapMemory2KHR", UnmapMemory2KHR, kAnalyze),
+    HOOK("CmdPushConstants", CmdPushConstants, kAnalyze),
+    HOOK("CmdUpdateBuffer", CmdUpdateBuffer, kAnalyze),
+    HOOK("CmdSetViewport", CmdSetViewport, kAnalyze),
+    HOOK("QueueSubmit", QueueSubmit, kAnalyze),
+    HOOK("QueueSubmit2", QueueSubmit2<&DeviceDispatch::QueueSubmit2>, kAnalyze),
+    HOOK("QueueSubmit2KHR", QueueSubmit2<&DeviceDispatch::QueueSubmit2KHR>, kAnalyze),
 };
 static const Hook kInstanceHooks[] = {
-    HOOK("GetInstanceProcAddr", GetInstanceProcAddr, false),
-    HOOK("CreateInstance", CreateInstance, false),
-    HOOK("DestroyInstance", DestroyInstance, false),
-    HOOK("CreateDevice", CreateDevice, false),
+    HOOK("GetInstanceProcAddr", GetInstanceProcAddr, kAlways),
+    HOOK("CreateInstance", CreateInstance, kAlways),
+    HOOK("DestroyInstance", DestroyInstance, kAlways),
+    HOOK("CreateDevice", CreateDevice, kAlways),
 };
 #undef HOOK
 
@@ -908,7 +1026,8 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL GetDeviceProcAddr(VkDevice devic
     PFN_vkVoidFunction next = dev->d.GetDeviceProcAddr(device, name);
     if (!next) return nullptr;  // never expose functions the device lacks
     const Hook* h = find_hook(kDeviceHooks, sizeof(kDeviceHooks) / sizeof(kDeviceHooks[0]), name);
-    if (h && (!h->depth_only || dev->depth_capture)) {
+    if (h && (h->needs == kAlways || (h->needs == kDepth && dev->depth_capture) ||
+              (h->needs == kAnalyze && dev->analyzer))) {
         // The *IndirectCount KHR aliases call the core pointer; make sure it exists.
         if (!strcmp(name, "vkCmdDrawIndirectCountKHR") && !dev->d.CmdDrawIndirectCount)
             dev->d.CmdDrawIndirectCount = reinterpret_cast<PFN_vkCmdDrawIndirectCount>(next);

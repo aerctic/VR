@@ -13,7 +13,7 @@
 namespace vrl {
 
 constexpr uint32_t kMagic = 0x594C5256;  // "VRLY"
-constexpr uint32_t kProtocolVersion = 1;
+constexpr uint32_t kProtocolVersion = 2;
 constexpr uint32_t kMaxSlots = 3;
 constexpr const char* kDefaultSocketName = "vrlayer";
 
@@ -25,6 +25,9 @@ enum class MsgType : uint32_t {
     Release,         // compositor -> layer: done reading slot N
     Control,         // vrlayer-ctl -> compositor: text command
     ControlReply,    // compositor -> vrlayer-ctl: text reply
+    Analysis,        // layer -> compositor: what was learned about the game
+    Camera,          // compositor -> layer: head pose to write into the game camera
+    AnalysisRestart, // compositor -> layer: forget the results and search again
 };
 
 // How frames are shared.
@@ -110,7 +113,62 @@ struct FrameMsg {
     uint64_t frame_index;
     uint64_t timestamp_ns;  // CLOCK_MONOTONIC when the copy finished
     uint32_t has_depth;     // depth slot contents are valid for this frame
+    uint32_t camera_valid;  // cam_rot/cam_pos hold the game's own camera this frame
+    uint32_t pose_seq;      // CameraMsg::seq injected into this frame (0 = none)
+    uint32_t eye;           // 0 = both, 1 = left, 2 = right (alternate-eye rendering)
+    // Game camera as the game wrote it, before any injection: camera->world
+    // rotation (row-major 3x3) and position in game units.
+    float cam_rot[9];
+    float cam_pos[3];
+};
+
+enum AnalysisFlags : uint32_t {
+    kAnalysisProjection = 1u << 0,     // main camera projection matrix found
+    kAnalysisView = 1u << 1,           // view (world->camera) matrix found next to it
+    kAnalysisViewProj = 1u << 2,       // combined view-projection found too
+    kAnalysisInverseView = 1u << 3,    // camera->world matrix found too
+    kAnalysisPushConstants = 1u << 4,  // camera lives in push constants / inline buffer updates
+    kAnalysisViewportFlip = 1u << 5,   // game uses negative-height viewports
+    kAnalysisDepth = 1u << 6,          // scene depth buffer selected
+    kAnalysisInjecting = 1u << 7,      // head pose is being written into the camera
+};
+
+struct AnalysisMsg {
+    MsgHeader h;
+    uint32_t flags;
+    uint32_t matrix_order;  // MatOrder
+    float hfov_deg, vfov_deg, aspect;
+    float near_d, far_d;     // far_d == 0: infinite
+    float depth_a, depth_b;  // depth = a + b / distance
+    float basis_up, basis_fwd;
+    uint32_t reversed;
+    uint32_t scanned_mb;  // host-visible memory searched so far
+    uint32_t mapped_mb;   // host-visible memory currently mapped
+    uint32_t proj_hits;   // copies of the projection seen in the last scan
+    uint32_t patched;     // view matrices rewritten for the last frame
+    uint32_t progress;    // 0..100 of the current search pass
+    char status[96];
+};
+
+enum class CameraMode : uint32_t {
+    Off = 0,
+    Head = 1,       // every frame gets the latest head pose (mono; stereo from depth)
+    Alternate = 2,  // alternate-eye rendering: frames alternate left / right eye
+};
+
+struct CameraMsg {
+    MsgHeader h;
+    uint32_t mode;          // CameraMode
+    uint32_t seq;           // echoed back in FrameMsg::pose_seq
+    float rotation[4];      // xyzw: head rotation relative to the game camera's rest pose
+    float translation[3];   // metres, in that rest frame
+    float units_per_metre;  // game world scale
+    float ipd;              // metres, for Alternate
     uint32_t pad;
+};
+
+struct AnalysisRestartMsg {
+    MsgHeader h;
 };
 
 struct ReleaseMsg {

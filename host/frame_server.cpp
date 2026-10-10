@@ -186,6 +186,13 @@ bool FrameServer::handle_message(Client& c, const char* buf, size_t n, std::vect
             c.last_frame_ns = now_ns();
             return true;
         }
+        case MsgType::Analysis: {
+            if (n < sizeof(AnalysisMsg)) return true;
+            c.info.analysis = *reinterpret_cast<const AnalysisMsg*>(buf);
+            c.info.analysis.status[sizeof(c.info.analysis.status) - 1] = 0;
+            c.info.has_analysis = true;
+            return true;
+        }
         case MsgType::Control: {
             if (n < sizeof(ControlMsg)) return false;
             auto* m = reinterpret_cast<const ControlMsg*>(buf);
@@ -373,6 +380,19 @@ void FrameServer::update_active() {
     }
 }
 
+bool FrameServer::send_camera(const CameraMsg& m) {
+    Client* c = find(active_id_);
+    return c && ipc_send(c->fd, &m, sizeof(m));
+}
+
+void FrameServer::restart_analysis() {
+    Client* c = find(active_id_);
+    if (!c) return;
+    auto m = make_msg<AnalysisRestartMsg>(MsgType::AnalysisRestart);
+    ipc_send(c->fd, &m, sizeof(m));
+    c->info.has_analysis = false;
+}
+
 void FrameServer::cycle_active() {
     std::vector<Client*> games;
     for (auto& c : clients_)
@@ -408,6 +428,11 @@ bool FrameServer::begin_frame(VkCommandBuffer cmd, FrameView* out) {
     out->has_depth = has_depth;
     out->frame_index = msg.frame_index;
     out->timestamp_ns = msg.timestamp_ns;
+    out->camera_valid = msg.camera_valid != 0;
+    memcpy(out->cam_rot, msg.cam_rot, sizeof(out->cam_rot));
+    memcpy(out->cam_pos, msg.cam_pos, sizeof(out->cam_pos));
+    out->pose_seq = msg.pose_seq;
+    out->eye = msg.eye;
 
     if (Transport(m.transport) == Transport::Gpu) {
         VkImageMemoryBarrier ib{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};

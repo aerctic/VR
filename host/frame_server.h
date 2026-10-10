@@ -28,6 +28,11 @@ struct FrameView {
     bool has_depth = false;
     uint64_t frame_index = 0;
     uint64_t timestamp_ns = 0;
+    // Game camera (before injection) and the head pose injected into this frame.
+    bool camera_valid = false;
+    float cam_rot[9] = {}, cam_pos[3] = {};
+    uint32_t pose_seq = 0;
+    uint32_t eye = 0;  // 0 both, 1 left, 2 right
 };
 
 struct ClientInfo {
@@ -39,6 +44,8 @@ struct ClientInfo {
     uint32_t width = 0, height = 0;
     bool depth = false;
     uint64_t frames = 0;
+    bool has_analysis = false;
+    AnalysisMsg analysis{};
 };
 
 class FrameServer {
@@ -65,6 +72,9 @@ public:
     void gpu_work_done();
 
     const ClientInfo* active() const;
+    // Camera control for the active game.
+    bool send_camera(const CameraMsg& m);
+    void restart_analysis();
     std::vector<ClientInfo> clients() const;
     void cycle_active();
 

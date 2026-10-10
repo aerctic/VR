@@ -25,6 +25,9 @@ public:
     // Blocks until no copy is in flight.
     void wait_idle();
 
+    // Send the analyzer's current findings to the compositor (if connected).
+    void report_analysis();
+
 private:
     enum class SlotState { Free, Copying, Sent };
     enum class Conn { Disconnected, AwaitWelcome, Ready };
@@ -50,6 +53,10 @@ private:
         VkFence fence = VK_NULL_HANDLE;
         uint64_t frame_index = 0;
         bool has_depth = false;
+        // Camera info for the frame in this slot.
+        bool camera_valid = false;
+        uint32_t pose_seq = 0, eye = 0;
+        float cam_rot[9] = {}, cam_pos[3] = {};
     };
 
     struct Job {

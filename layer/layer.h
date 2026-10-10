@@ -15,6 +15,7 @@
 namespace vrl {
 
 class Capture;
+class Analyzer;
 
 // Next-layer instance entry points we use.
 struct InstanceDispatch {
@@ -102,7 +103,14 @@ struct InstanceData {
     X(CmdDrawIndexedIndirect)        \
     X(CmdDrawIndirectCount)          \
     X(CmdDrawIndexedIndirectCount)   \
-    X(CmdExecuteCommands)
+    X(CmdExecuteCommands)            \
+    X(MapMemory2KHR)                 \
+    X(UnmapMemory2KHR)               \
+    X(CmdPushConstants)              \
+    X(CmdUpdateBuffer)               \
+    X(CmdSetViewport)                \
+    X(QueueSubmit2)                  \
+    X(QueueSubmit2KHR)
 
 struct DeviceDispatch {
 #define VRL_MEMBER(name) PFN_vk##name name;
@@ -196,6 +204,7 @@ struct DeviceData {
     bool depth_copied_since_present = false;
     uint32_t frames_since_depth_copy = 1000;
 
+    std::unique_ptr<Analyzer> analyzer;  // null when VRLAYER_ANALYZE=0
     std::unique_ptr<Capture> capture;
 };
 

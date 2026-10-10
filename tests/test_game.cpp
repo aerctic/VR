@@ -5,10 +5,18 @@
 // Scene: the left half of the screen is red at depth 0.25, the right half is
 // blue at depth 0.6. Runs until SIGTERM.
 //
-// usage: vrlayer_test_game renderpass|dynamic
+// In "camera" mode it also behaves like a typical D3D-on-DXVK game: every
+// frame it writes a camera block (world, view, projection, view-projection;
+// std140) into a host-mapped ring buffer at a new offset, and the right half's
+// green channel shows the camera yaw the GPU really used:
+// green = 0.5 + 0.5 * cos(yaw). The camera sits at (1, 2, 3), yawed 20 deg;
+// projection: 60 deg vertical FOV, 4:3, near 0.1, far 100.
+//
+// usage: vrlayer_test_game renderpass|dynamic [camera]
 
 #include <vulkan/vulkan.h>
 
+#include <cmath>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
@@ -31,11 +39,30 @@ static volatile sig_atomic_t g_stop = 0;
 struct PC {
     float color[4];
     float z;
+    float use_ubo;
 };
+
+// Column-major 4x4 helpers for the camera block.
+struct M4 {
+    float m[16];
+};
+static M4 identity() {
+    M4 r{};
+    r.m[0] = r.m[5] = r.m[10] = r.m[15] = 1;
+    return r;
+}
+static M4 mul(const M4& a, const M4& b) {
+    M4 r{};
+    for (int c = 0; c < 4; ++c)
+        for (int rr = 0; rr < 4; ++rr)
+            for (int k = 0; k < 4; ++k) r.m[c * 4 + rr] += a.m[k * 4 + rr] * b.m[c * 4 + k];
+    return r;
+}
 
 int main(int argc, char** argv) {
     signal(SIGTERM, [](int) { g_stop = 1; });
     const bool dynamic = argc > 1 && !strcmp(argv[1], "dynamic");
+    const bool camera = argc > 2 && !strcmp(argv[2], "camera");
     const uint32_t W = 160, H = 120;
 
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -201,8 +228,89 @@ int main(int argc, char** argv) {
     smci.codeSize = sizeof(kFullscreenFragSpv);
     smci.pCode = kFullscreenFragSpv;
     CHECK(vkCreateShaderModule(device, &smci, nullptr, &fs));
+    // Camera ring buffer (host-visible, persistently mapped).
+    const VkDeviceSize kBlock = 256, kRing = 1 << 20;
+    VkBufferCreateInfo ubci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    ubci.size = kRing;
+    ubci.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+    VkBuffer ubo;
+    CHECK(vkCreateBuffer(device, &ubci, nullptr, &ubo));
+    vkGetBufferMemoryRequirements(device, ubo, &req);
+    VkMemoryAllocateInfo umai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    umai.allocationSize = req.size;
+    umai.memoryTypeIndex = UINT32_MAX;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i)
+        if ((req.memoryTypeBits & (1u << i)) &&
+            (mp.memoryTypes[i].propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+                (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+            umai.memoryTypeIndex = i;
+            break;
+        }
+    VkDeviceMemory ubo_mem;
+    CHECK(vkAllocateMemory(device, &umai, nullptr, &ubo_mem));
+    CHECK(vkBindBufferMemory(device, ubo, ubo_mem, 0));
+    uint8_t* ubo_ptr;
+    CHECK(vkMapMemory(device, ubo_mem, 0, VK_WHOLE_SIZE, 0, reinterpret_cast<void**>(&ubo_ptr)));
+    memset(ubo_ptr, 0, kRing);
+
+    VkDescriptorSetLayoutBinding dslb{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_FRAGMENT_BIT,
+                                      nullptr};
+    VkDescriptorSetLayoutCreateInfo dslci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dslci.bindingCount = 1;
+    dslci.pBindings = &dslb;
+    VkDescriptorSetLayout dsl;
+    CHECK(vkCreateDescriptorSetLayout(device, &dslci, nullptr, &dsl));
+    VkDescriptorPoolSize dps{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1};
+    VkDescriptorPoolCreateInfo dpci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpci.maxSets = 1;
+    dpci.poolSizeCount = 1;
+    dpci.pPoolSizes = &dps;
+    VkDescriptorPool dpool;
+    CHECK(vkCreateDescriptorPool(device, &dpci, nullptr, &dpool));
+    VkDescriptorSetAllocateInfo dsai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    dsai.descriptorPool = dpool;
+    dsai.descriptorSetCount = 1;
+    dsai.pSetLayouts = &dsl;
+    VkDescriptorSet dset;
+    CHECK(vkAllocateDescriptorSets(device, &dsai, &dset));
+    VkDescriptorBufferInfo dbi{ubo, 0, kBlock};
+    VkWriteDescriptorSet wds{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    wds.dstSet = dset;
+    wds.descriptorCount = 1;
+    wds.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+    wds.pBufferInfo = &dbi;
+    vkUpdateDescriptorSets(device, 1, &wds, 0, nullptr);
+
+    // Camera matrices (column-major, Vulkan right-handed, y down in clip space).
+    const float kPi = 3.14159265f, yaw = 20.0f * kPi / 180.0f, t = std::tan(30.0f * kPi / 180.0f);
+    const float n_ = 0.1f, f_ = 100.0f;
+    M4 cam_world = identity();  // camera -> world
+    cam_world.m[0] = std::cos(yaw);
+    cam_world.m[2] = -std::sin(yaw);
+    cam_world.m[8] = std::sin(yaw);
+    cam_world.m[10] = std::cos(yaw);
+    cam_world.m[12] = 1;
+    cam_world.m[13] = 2;
+    cam_world.m[14] = 3;
+    M4 view = identity();  // inverse of a rigid transform
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) view.m[j * 4 + i] = cam_world.m[i * 4 + j];
+    for (int i = 0; i < 3; ++i)
+        view.m[12 + i] = -(view.m[i] * cam_world.m[12] + view.m[4 + i] * cam_world.m[13] + view.m[8 + i] * cam_world.m[14]);
+    M4 proj{};
+    proj.m[0] = 1.0f / (float(W) / float(H) * t);
+    proj.m[5] = -1.0f / t;
+    proj.m[10] = f_ / (n_ - f_);
+    proj.m[11] = -1.0f;
+    proj.m[14] = n_ * f_ / (n_ - f_);
+    M4 object = identity();  // an object's world matrix sharing the block
+    object.m[12] = 5;
+    const M4 view_proj = mul(proj, view);
+
     VkPushConstantRange pcr{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(PC)};
     VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plci.setLayoutCount = 1;
+    plci.pSetLayouts = &dsl;
     plci.pushConstantRangeCount = 1;
     plci.pPushConstantRanges = &pcr;
     VkPipelineLayout layout;
@@ -331,19 +439,30 @@ int main(int argc, char** argv) {
             vkCmdBeginRenderPass(cmd, &rbi, VK_SUBPASS_CONTENTS_INLINE);
         }
 
+        // Upload this frame's camera block to a fresh ring offset, like a
+        // D3D11 Map(DISCARD) through DXVK.
+        uint32_t ring_off = uint32_t((frames % (kRing / kBlock)) * kBlock);
+        if (camera) {
+            uint8_t* blk = ubo_ptr + ring_off;
+            memcpy(blk, object.m, 64);
+            memcpy(blk + 64, view.m, 64);
+            memcpy(blk + 128, proj.m, 64);
+            memcpy(blk + 192, view_proj.m, 64);
+        }
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &dset, 1, &ring_off);
         VkViewport viewport{0, 0, float(W), float(H), 0, 1};
         vkCmdSetViewport(cmd, 0, 1, &viewport);
         // Right half: blue, far.
         VkRect2D right{{int32_t(W / 2), 0}, {W / 2, H}};
         vkCmdSetScissor(cmd, 0, 1, &right);
-        PC pc{{0, 0, 1, 1}, 0.6f};
+        PC pc{{0, 0, 1, 1}, 0.6f, camera ? 1.0f : 0.0f};
         vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
         vkCmdDraw(cmd, 3, 1, 0, 0);
         // Left half: red, near.
         VkRect2D left{{0, 0}, {W / 2, H}};
         vkCmdSetScissor(cmd, 0, 1, &left);
-        pc = {{1, 0, 0, 1}, 0.25f};
+        pc = {{1, 0, 0, 1}, 0.25f, 0.0f};
         vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
         vkCmdDraw(cmd, 3, 1, 0, 0);
 
@@ -394,6 +513,11 @@ int main(int argc, char** argv) {
     vkDestroyCommandPool(device, pool, nullptr);
     vkDestroyPipeline(device, pipeline, nullptr);
     vkDestroyPipelineLayout(device, layout, nullptr);
+    vkDestroyDescriptorPool(device, dpool, nullptr);
+    vkDestroyDescriptorSetLayout(device, dsl, nullptr);
+    vkUnmapMemory(device, ubo_mem);
+    vkDestroyBuffer(device, ubo, nullptr);
+    vkFreeMemory(device, ubo_mem, nullptr);
     vkDestroyShaderModule(device, vs, nullptr);
     vkDestroyShaderModule(device, fs, nullptr);
     for (auto fb : fbs)

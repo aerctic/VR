@@ -8,6 +8,7 @@
 #include <cstring>
 #include <string>
 
+#include "analyzer.h"
 #include "ipc.h"
 #include "log.h"
 
@@ -145,8 +146,17 @@ void Capture::poll_connection() {
                 ++connection_generation_;  // a new compositor may accept what the old one did not
                 VRL_LOG("layer", "connected to compositor (%s transport)",
                         transport_ == Transport::Gpu ? "gpu" : "cpu");
+                report_analysis();
                 break;
             }
+            case MsgType::Camera: {
+                if (size_t(n) < sizeof(CameraMsg) || !dev_->analyzer) break;
+                dev_->analyzer->set_camera(*reinterpret_cast<CameraMsg*>(buf));
+                break;
+            }
+            case MsgType::AnalysisRestart:
+                if (dev_->analyzer) dev_->analyzer->restart();
+                break;
             case MsgType::Release: {
                 if (size_t(n) < sizeof(ReleaseMsg)) break;
                 auto* r = reinterpret_cast<ReleaseMsg*>(buf);
@@ -466,6 +476,14 @@ bool Capture::on_present(VkQueue queue, const VkPresentInfoKHR* info, VkSemaphor
 
     slot->has_depth = depth_valid && depth_format_ != DepthFormat::None;
     slot->frame_index = ++frame_counter_;
+    slot->camera_valid = false;
+    slot->pose_seq = slot->eye = 0;
+    if (dev_->analyzer) {
+        slot->camera_valid = dev_->analyzer->camera(slot->cam_rot, slot->cam_pos);
+        dev_->analyzer->frame_injection(&slot->pose_seq, &slot->eye);
+    }
+    // Keep the compositor informed even when nothing changes (it may have restarted).
+    if (dev_->analyzer && frame_counter_ % 60 == 0) report_analysis();
     if (!record_and_submit(*slot, queue, family, sc_image, slot->has_depth ? &depth : nullptr, info, signal)) {
         std::lock_guard<std::mutex> l(slot_mtx_);
         slot->state = SlotState::Free;
@@ -630,6 +648,13 @@ bool Capture::record_and_submit(Slot& s, VkQueue queue, uint32_t family, VkImage
 // Worker: waits for the copy to land, then announces the frame
 // ---------------------------------------------------------------------------
 
+void Capture::report_analysis() {
+    if (!dev_->analyzer || conn_ != Conn::Ready) return;
+    AnalysisMsg m = dev_->analyzer->report();
+    std::lock_guard<std::mutex> l(io_mtx_);
+    if (fd_ >= 0 && !ipc_send(fd_, &m, sizeof(m))) broken_ = true;
+}
+
 void Capture::wait_idle() {
     std::unique_lock<std::mutex> l(job_mtx_);
     idle_cv_.wait(l, [&] { return jobs_.empty() && !worker_busy_; });
@@ -668,6 +693,11 @@ void Capture::worker_main() {
             m.frame_index = s.frame_index;
             m.timestamp_ns = now_ns();
             m.has_depth = s.has_depth;
+            m.camera_valid = s.camera_valid;
+            m.pose_seq = s.pose_seq;
+            m.eye = s.eye;
+            memcpy(m.cam_rot, s.cam_rot, sizeof(m.cam_rot));
+            memcpy(m.cam_pos, s.cam_pos, sizeof(m.cam_pos));
             std::lock_guard<std::mutex> l(io_mtx_);
             ok = fd_ >= 0 && ipc_send(fd_, &m, sizeof(m));
             if (!ok) broken_ = true;

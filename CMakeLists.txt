@@ -32,7 +32,7 @@ add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initi
 # ---------------------------------------------------------------------------
 # Shared code
 # ---------------------------------------------------------------------------
-add_library(vrlayer_common STATIC common/ipc.cpp common/config.cpp)
+add_library(vrlayer_common STATIC common/ipc.cpp common/config.cpp common/camera_math.cpp)
 target_include_directories(vrlayer_common PUBLIC common)
 set_target_properties(vrlayer_common PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -40,7 +40,7 @@ set_target_properties(vrlayer_common PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # Vulkan implicit layer (loaded into the game)
 # ---------------------------------------------------------------------------
 if(VRLAYER_BUILD_LAYER)
-  add_library(VkLayer_vrlayer SHARED layer/layer.cpp layer/capture.cpp)
+  add_library(VkLayer_vrlayer SHARED layer/layer.cpp layer/capture.cpp layer/analyzer.cpp)
   target_include_directories(VkLayer_vrlayer PRIVATE ${VULKAN_HEADERS_DIR})
   target_link_libraries(VkLayer_vrlayer PRIVATE vrlayer_common Threads::Threads)
   set_target_properties(VkLayer_vrlayer PROPERTIES CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)
@@ -153,6 +153,15 @@ if(VRLAYER_BUILD_TESTS)
     add_executable(vrlayer_e2e_test tests/e2e_test.cpp)
     target_link_libraries(vrlayer_e2e_test PRIVATE vrlayer_host)
     add_dependencies(vrlayer_e2e_test VkLayer_vrlayer vrlayer_test_game)
+    add_executable(vrlayer_e2e_camera_test tests/e2e_camera_test.cpp)
+    target_link_libraries(vrlayer_e2e_camera_test PRIVATE vrlayer_host)
+    add_dependencies(vrlayer_e2e_camera_test VkLayer_vrlayer vrlayer_test_game)
+    foreach(transport gpu cpu)
+      add_test(NAME e2e_camera_${transport}
+               COMMAND vrlayer_e2e_camera_test $<TARGET_FILE:vrlayer_test_game> ${CMAKE_BINARY_DIR}/devroot ${transport})
+      set_tests_properties(e2e_camera_${transport} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    endforeach()
+
     foreach(transport gpu cpu)
       foreach(api renderpass dynamic)
         add_test(NAME e2e_${transport}_${api}
