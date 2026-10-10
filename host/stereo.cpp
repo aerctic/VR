@@ -17,6 +17,9 @@ struct PushConstants {
     float popout;
     float far_plane;
     int32_t steps;
+    float depth_a;
+    float depth_b;
+    float conv_dist;
 };
 constexpr uint32_t kFlagStereo = 1;
 constexpr uint32_t kFlagReversed = 2;
@@ -24,6 +27,7 @@ constexpr uint32_t kFlagFlipY = 4;
 constexpr uint32_t kFlagSrgbDecode = 8;
 constexpr uint32_t kFlagShowDepth = 16;
 constexpr uint32_t kFlagHasDepth = 32;
+constexpr uint32_t kFlagExactDepth = 64;
 struct Stats {
     uint32_t zero_count, one_count, samples;
 };
@@ -175,7 +179,10 @@ bool StereoRenderer::record(VkCommandBuffer cmd, const FrameView& f, const Stere
     pc.depth_format = uint32_t(f.depth_format);
     pc.flags = (stereo ? kFlagStereo : 0u) | (p.reversed_depth ? kFlagReversed : 0u) | (p.flip_y ? kFlagFlipY : 0u) |
                (format_needs_srgb_decode(f.format) ? kFlagSrgbDecode : 0u) | (p.show_depth ? kFlagShowDepth : 0u) |
-               (f.has_depth ? kFlagHasDepth : 0u);
+               (f.has_depth ? kFlagHasDepth : 0u) | (p.exact_depth ? kFlagExactDepth : 0u);
+    pc.depth_a = p.depth_a;
+    pc.depth_b = p.depth_b;
+    pc.conv_dist = p.convergence_distance > 0 ? p.convergence_distance : 1.0f;
     pc.separation = p.separation;
     pc.convergence = p.convergence;
     pc.popout = p.popout;

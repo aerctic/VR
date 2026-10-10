@@ -28,6 +28,7 @@ const std::vector<Field>& fields() {
         F("display.game_fov", Float, game_fov),
         F("display.immersive_distance", Float, immersive_distance),
         F("display.immersive_latency_ms", Float, immersive_latency_ms),
+        F("display.environment", Bool, environment),
         F("stereo.enabled", Bool, stereo),
         F("stereo.separation", Float, separation),
         F("stereo.convergence", Float, convergence),
@@ -37,11 +38,25 @@ const std::vector<Field>& fields() {
         F("stereo.depth_flip_y", Bool, depth_flip_y),
         F("stereo.search_steps", Int, search_steps),
         F("stereo.show_depth", Bool, show_depth),
+        F("stereo.convergence_near", Float, convergence_near),
+        F("vr.camera", String, vr_camera),
+        F("vr.units_per_metre", Float, units_per_metre),
+        F("vr.ipd", Float, ipd),
+        F("vr.aim", String, aim),
+        F("vr.snap_turn", Float, snap_turn),
+        F("vr.turn_speed", Float, turn_speed),
+        F("loading.enabled", Bool, loading),
+        F("loading.auto_continue", Bool, auto_continue),
+        F("loading.timeout", Float, loading_timeout),
+        F("loading.calibrate_mouse", Bool, calibrate_mouse),
         F("input.head_mouse", Bool, head_mouse),
         F("input.mouse_counts_per_degree", Float, mouse_counts_per_degree),
         F("input.mouse_invert_y", Bool, mouse_invert_y),
         F("input.head_mouse_pitch", Bool, head_mouse_pitch),
         F("input.gamepad", Bool, gamepad),
+        F("input.scheme", String, scheme),
+        F("input.pointer", Bool, pointer),
+        F("input.hand_tracking", Bool, hand_tracking),
     };
     return f;
 }
@@ -58,7 +73,22 @@ bool parse_bool(const std::string& v, bool* out) {
 
 }  // namespace
 
+static bool valid_choice(const std::string& key, const std::string& v) {
+    static const std::map<std::string, std::set<std::string>> choices = {
+        {"stereo.depth_reversed", {"auto", "true", "false"}},
+        {"vr.camera", {"head", "alternate"}},
+        {"vr.aim", {"auto", "head", "body"}},
+        {"input.scheme", {"gamepad", "keyboard_mouse"}},
+    };
+    auto it = choices.find(key);
+    return it == choices.end() || it->second.count(v) != 0;
+}
+
 bool Settings::set(const std::string& key, const std::string& value, std::string* error) {
+    if (key.rfind("bindings.", 0) == 0 && key.size() > 9) {
+        bindings[key.substr(9)] = value;
+        return true;
+    }
     for (const Field& f : fields()) {
         if (key != f.key) continue;
         void* p = f.ptr(*this);
@@ -80,12 +110,13 @@ bool Settings::set(const std::string& key, const std::string& value, std::string
                 if (parse_bool(value, static_cast<bool*>(p))) return true;
                 break;
             case Kind::String:
-                if (key == "stereo.depth_reversed" && value != "auto" && value != "true" && value != "false") break;
+                if (!valid_choice(key, value)) break;
                 *static_cast<std::string*>(p) = value;
                 return true;
             case Kind::Mode:
                 if (value == "theater" || value == "theatre") *static_cast<ViewMode*>(p) = ViewMode::Theater;
                 else if (value == "immersive") *static_cast<ViewMode*>(p) = ViewMode::Immersive;
+                else if (value == "vr") *static_cast<ViewMode*>(p) = ViewMode::Vr;
                 else break;
                 return true;
         }
@@ -97,6 +128,10 @@ bool Settings::set(const std::string& key, const std::string& value, std::string
 }
 
 std::string Settings::get(const std::string& key) const {
+    if (key.rfind("bindings.", 0) == 0) {
+        auto it = bindings.find(key.substr(9));
+        return it == bindings.end() ? "" : it->second;
+    }
     Settings& self = const_cast<Settings&>(*this);
     for (const Field& f : fields()) {
         if (key != f.key) continue;
@@ -107,7 +142,11 @@ std::string Settings::get(const std::string& key) const {
             case Kind::Int: o << *static_cast<int*>(p); break;
             case Kind::Bool: o << (*static_cast<bool*>(p) ? "true" : "false"); break;
             case Kind::String: o << *static_cast<std::string*>(p); break;
-            case Kind::Mode: o << (*static_cast<ViewMode*>(p) == ViewMode::Theater ? "theater" : "immersive"); break;
+            case Kind::Mode: {
+                ViewMode m = *static_cast<ViewMode*>(p);
+                o << (m == ViewMode::Theater ? "theater" : m == ViewMode::Immersive ? "immersive" : "vr");
+                break;
+            }
         }
         return o.str();
     }
@@ -117,7 +156,9 @@ std::string Settings::get(const std::string& key) const {
 Settings Settings::from_config(const Config& cfg) {
     Settings s;
     for (const Field& f : fields())
-        if (cfg.has(f.key)) s.set(f.key, cfg.get_string(f.key, ""), nullptr);
+        if (cfg.has(f.key) && s.set(f.key, cfg.get_string(f.key, ""), nullptr)) s.explicit_keys.insert(f.key);
+    for (auto& [k, v] : cfg.values())
+        if (k.rfind("bindings.", 0) == 0) s.set(k, v, nullptr);
     return s;
 }
 
@@ -132,6 +173,10 @@ std::string Settings::dump() const {
             o << (o.tellp() > 0 ? "\n" : "") << "[" << section << "]\n";
         }
         o << k.substr(dot + 1) << " = " << get(k) << "\n";
+    }
+    if (!bindings.empty()) {
+        o << "\n[bindings]\n";
+        for (auto& [b, key] : bindings) o << b << " = " << key << "\n";
     }
     return o.str();
 }

@@ -13,10 +13,41 @@ public:
     bool open();
     bool is_open() const { return fd_ >= 0; }
     void move(int dx, int dy);
+    void button(int code, bool down);  // BTN_LEFT / BTN_RIGHT / ...
     void close();
 
 private:
     int fd_ = -1;
+};
+
+// Keyboard for the keyboard_mouse control scheme.
+class UinputKeyboard {
+public:
+    ~UinputKeyboard();
+    bool open();
+    bool is_open() const { return fd_ >= 0; }
+    void key(int code, bool down);
+    void close();  // releases held keys
+
+private:
+    int fd_ = -1;
+    bool held_[256] = {};
+};
+
+// Absolute pointer (like a tablet) for pointing at the virtual screen with a
+// controller or hand. Coordinates are normalized 0..1 over the desktop.
+class UinputPointer {
+public:
+    ~UinputPointer();
+    bool open();
+    bool is_open() const { return fd_ >= 0; }
+    void move_to(float u, float v);
+    void button(int code, bool down);
+    void close();
+
+private:
+    int fd_ = -1;
+    int last_x_ = -1, last_y_ = -1;
 };
 
 struct GamepadState {

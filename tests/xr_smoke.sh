@@ -13,6 +13,8 @@ export XDG_RUNTIME_DIR="$T/run"
 mkdir -m 700 "$XDG_RUNTIME_DIR"
 export XDG_CONFIG_HOME="$T/config"
 export VRLAYER_SOCKET="vrlayer-smoke-$$"
+# Load the shipped profiles from this checkout, exactly like an install would.
+export VRLAYER_DATADIR="$(cd "$(dirname "$0")/.." && pwd)"
 CTL="$B/vrlayer-ctl"
 pids=()
 fail=0
@@ -37,10 +39,10 @@ expect() {  # expect <description> <regex> [timeout s]
     done
 }
 
-game() {  # game <log> [env...]
-    local log="$1"; shift
+game() {  # game <log> <test game mode> [env...]
+    local log="$1" mode="$2"; shift 2
     env ENABLE_VRLAYER=1 XDG_DATA_HOME="$B/devroot" SteamAppId=4242 VRLAYER_DEPTH_MIN_DRAWS=1 "$@" \
-        "$B/vrlayer_test_game" renderpass >"$T/$log" 2>&1 &
+        "$B/vrlayer_test_game" renderpass $mode >"$T/$log" 2>&1 &
     pids+=($!)
     echo $!
 }
@@ -53,13 +55,31 @@ pids+=($!)
 sleep 2
 
 # 1. Game first: the layer must keep retrying and connect once the compositor is up.
-g1=$(game game1.log)
+g1=$(game game1.log camera)
 sleep 1.5
 "$B/vrlayer-compositor" >"$T/comp.log" 2>&1 &
 pids+=($!)
 expect "compositor session running" "session running" 15
 expect "late compositor picks up running game (gpu)" "frame: 160x120 via gpu, depth yes"
-expect "stereo active" "stereo: on"
+expect "VR loading screen shown" "phase: loading"
+
+# 2. Loading screen: the layer finds the camera, then VR mode starts by itself.
+expect "camera lens detected" "camera: fov 75.* view found" 20
+expect "loading screen recommends vr" "recommended vr"
+expect "auto-start into VR mode" "phase: playing" 20
+expect "6DOF mode active" "mode: vr"
+expect "head pose injected into the game camera" "injecting \\([0-9]+/frame\\)" 10
+"$CTL" set vr.camera alternate >/dev/null && expect "alternate-eye rendering" "camera alternate.*" 5
+expect "alternate-eye injection" "injecting \\([0-9]+/frame\\)" 10
+"$CTL" set vr.camera head >/dev/null
+grep -q "game_fov = 75" "$XDG_CONFIG_HOME/vrlayer/games/4242.auto.ini" 2>/dev/null && echo "ok   detection saved to auto profile" ||
+    { echo "FAIL auto profile missing"; fail=1; }
+
+# 3. Back to the loading screen and continue in theater.
+"$CTL" loading >/dev/null && expect "loading screen on request" "phase: loading"
+expect "injection stops while loading" "view found\$" 10
+"$CTL" continue theater >/dev/null && expect "continue in theater" "phase: playing"
+expect "theater mode" "mode: theater"
 
 # 2. Live control.
 "$CTL" mode immersive >/dev/null && expect "switch to immersive" "mode: immersive"
@@ -75,7 +95,7 @@ kill -9 "$g1"
 expect "crashed game dropped" "game: none connected"
 
 # 4. Cpu transport, and the saved profile is applied (curved=false was saved).
-game game2.log VRLAYER_TRANSPORT=cpu >/dev/null
+game game2.log "" VRLAYER_TRANSPORT=cpu >/dev/null
 expect "cpu transport game" "frame: 160x120 via cpu, depth yes"
 [ "$("$CTL" get display.curved)" = "display.curved = false" ] && echo "ok   saved profile loaded" ||
     { echo "FAIL saved profile not loaded"; fail=1; }

@@ -16,6 +16,10 @@ struct StereoParams {
     float popout = 0.5f;
     float far_plane = 1000.0f;
     int search_steps = 24;
+    // Exact depth from the detected projection: distance = depth_b / (depth - depth_a).
+    bool exact_depth = false;
+    float depth_a = 0, depth_b = 0;
+    float convergence_distance = 3.0f;  // game units
 };
 
 class StereoRenderer {

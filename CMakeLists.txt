@@ -92,6 +92,7 @@ if(VRLAYER_BUILD_COMPOSITOR OR VRLAYER_BUILD_TESTS)
   endif()
   set(HOST_SHADERS)
   vrlayer_shader(HOST_SHADERS shaders/stereo.comp kStereoCompSpv)
+  vrlayer_shader(HOST_SHADERS shaders/scene.comp kSceneCompSpv)
 
   add_library(vrlayer_host STATIC
     host/gpu.cpp
@@ -100,6 +101,11 @@ if(VRLAYER_BUILD_COMPOSITOR OR VRLAYER_BUILD_TESTS)
     host/settings.cpp
     host/head_mouse.cpp
     host/uinput.cpp
+    host/canvas.cpp
+    host/scene.cpp
+    host/calibrator.cpp
+    host/controls.cpp
+    host/loading.cpp
     ${HOST_SHADERS})
   target_include_directories(vrlayer_host PUBLIC host ${CMAKE_BINARY_DIR}/shaders)
   target_link_libraries(vrlayer_host PUBLIC vrlayer_common Vulkan::Vulkan Threads::Threads)
@@ -114,8 +120,11 @@ if(VRLAYER_BUILD_COMPOSITOR)
 
   add_executable(vrlayer-compositor
     compositor/main.cpp
+    compositor/app.cpp
+    compositor/render.cpp
     compositor/xr.cpp
     compositor/input.cpp
+    compositor/hands.cpp
     compositor/vrmath.cpp)
   target_include_directories(vrlayer-compositor PRIVATE compositor)
   target_link_libraries(vrlayer-compositor PRIVATE vrlayer_host PkgConfig::OPENXR)
@@ -141,6 +150,11 @@ if(VRLAYER_BUILD_TESTS)
   target_link_libraries(vrlayer_unit_tests PRIVATE vrlayer_host)
   target_compile_definitions(vrlayer_unit_tests PRIVATE VRLAYER_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
   add_test(NAME unit COMMAND vrlayer_unit_tests)
+
+  add_executable(vrlayer_render_test tests/render_test.cpp)
+  target_link_libraries(vrlayer_render_test PRIVATE vrlayer_host)
+  add_test(NAME render COMMAND vrlayer_render_test)
+  set_tests_properties(render PROPERTIES SKIP_RETURN_CODE 77)
 
   if(VRLAYER_BUILD_LAYER)
     set(TEST_SHADERS)

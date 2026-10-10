@@ -106,7 +106,11 @@ std::string config_dir() {
 
 std::vector<std::string> profile_paths(uint32_t appid) {
     std::vector<std::string> paths{config_dir() + "/default.ini"};
-    if (appid) paths.push_back(config_dir() + "/games/" + std::to_string(appid) + ".ini");
+    if (appid) {
+        // Results detected by the loading screen, then the user's own settings.
+        paths.push_back(config_dir() + "/games/" + std::to_string(appid) + ".auto.ini");
+        paths.push_back(config_dir() + "/games/" + std::to_string(appid) + ".ini");
+    }
     return paths;
 }
 

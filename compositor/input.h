@@ -8,6 +8,7 @@
 //   left menu                -> Start      (Index: left trackpad press)
 //   left menu + left grip    -> Back       (Index: right trackpad press, Vive: right menu)
 //   hold Start 1 s           -> recenter the screen
+//   hold Start 3 s           -> back to the VR loading screen
 //   hold both stick clicks 1.5 s -> toggle theater / immersive
 #pragma once
 
@@ -28,21 +29,28 @@ public:
         GamepadState pad;
         bool recenter = false;
         bool toggle_mode = false;
+        bool open_loading = false;
+        // Controller aim rays in local space (pointing along -Z of the pose).
+        bool aim_valid[2] = {false, false};
+        XrPosef aim[2];
+        bool active[2] = {false, false};  // a controller is bound and tracked for this hand
     };
-    // dt in seconds since the previous call.
-    Result sync(XrSession session, float dt);
+    // dt in seconds since the previous call; poses are located at `time` in `base`.
+    Result sync(XrSession session, float dt, XrSpace base, XrTime time);
 
 private:
     XrActionSet set_ = XR_NULL_HANDLE;
     XrPath hands_[2] = {XR_NULL_PATH, XR_NULL_PATH};
     XrAction stick_ = XR_NULL_HANDLE, stick_click_ = XR_NULL_HANDLE, trigger_ = XR_NULL_HANDLE,
              squeeze_ = XR_NULL_HANDLE, menu_ = XR_NULL_HANDLE, back_ = XR_NULL_HANDLE, a_ = XR_NULL_HANDLE,
-             b_ = XR_NULL_HANDLE, x_ = XR_NULL_HANDLE, y_ = XR_NULL_HANDLE;
+             b_ = XR_NULL_HANDLE, x_ = XR_NULL_HANDLE, y_ = XR_NULL_HANDLE, aim_ = XR_NULL_HANDLE;
+    XrSpace aim_space_[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
     bool attached_ = false;
 
     float start_held_ = 0;
     bool start_was_down_ = false;
     bool start_consumed_ = false;
+    bool loading_fired_ = false;
     float start_pulse_ = 0;  // keep Start pressed for a moment after a short tap
     float sticks_held_ = 0;
     bool sticks_consumed_ = false;

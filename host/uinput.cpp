@@ -66,8 +66,7 @@ bool UinputMouse::open() {
     int fd = open_uinput();
     if (fd < 0) return false;
     ioctl(fd, UI_SET_EVBIT, EV_KEY);
-    ioctl(fd, UI_SET_KEYBIT, BTN_LEFT);  // needed for the device to be classified as a mouse
-    ioctl(fd, UI_SET_KEYBIT, BTN_RIGHT);
+    for (int b : {BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA}) ioctl(fd, UI_SET_KEYBIT, b);
     ioctl(fd, UI_SET_EVBIT, EV_REL);
     ioctl(fd, UI_SET_RELBIT, REL_X);
     ioctl(fd, UI_SET_RELBIT, REL_Y);
@@ -84,6 +83,12 @@ void UinputMouse::move(int dx, int dy) {
     if (fd_ < 0 || (dx == 0 && dy == 0)) return;
     if (dx) emit(fd_, EV_REL, REL_X, dx);
     if (dy) emit(fd_, EV_REL, REL_Y, dy);
+    emit(fd_, EV_SYN, SYN_REPORT, 0);
+}
+
+void UinputMouse::button(int code, bool down) {
+    if (fd_ < 0) return;
+    emit(fd_, EV_KEY, code, down ? 1 : 0);
     emit(fd_, EV_SYN, SYN_REPORT, 0);
 }
 
@@ -188,6 +193,95 @@ void UinputGamepad::close() {
     if (fd_ < 0) return;
     // Release everything so the game does not see stuck buttons.
     update(GamepadState{});
+    ioctl(fd_, UI_DEV_DESTROY);
+    ::close(fd_);
+    fd_ = -1;
+}
+
+
+
+// ---------------------------------------------------------------------------
+
+UinputKeyboard::~UinputKeyboard() { close(); }
+
+bool UinputKeyboard::open() {
+    if (fd_ >= 0) return true;
+    int fd = open_uinput();
+    if (fd < 0) return false;
+    ioctl(fd, UI_SET_EVBIT, EV_KEY);
+    for (int k = KEY_ESC; k <= KEY_MICMUTE && k < 256; ++k) ioctl(fd, UI_SET_KEYBIT, k);
+    if (!create_device(fd, "VRLayer Keyboard", 0x1209, 0x5653, 1)) {
+        VRL_LOG("input", "failed to create virtual keyboard");
+        ::close(fd);
+        return false;
+    }
+    fd_ = fd;
+    return true;
+}
+
+void UinputKeyboard::key(int code, bool down) {
+    if (fd_ < 0 || code <= 0 || code >= 256 || held_[code] == down) return;
+    held_[code] = down;
+    emit(fd_, EV_KEY, code, down ? 1 : 0);
+    emit(fd_, EV_SYN, SYN_REPORT, 0);
+}
+
+void UinputKeyboard::close() {
+    if (fd_ < 0) return;
+    for (int k = 0; k < 256; ++k)
+        if (held_[k]) key(k, false);
+    ioctl(fd_, UI_DEV_DESTROY);
+    ::close(fd_);
+    fd_ = -1;
+}
+
+// ---------------------------------------------------------------------------
+
+UinputPointer::~UinputPointer() { close(); }
+
+bool UinputPointer::open() {
+    if (fd_ >= 0) return true;
+    int fd = open_uinput();
+    if (fd < 0) return false;
+    ioctl(fd, UI_SET_EVBIT, EV_KEY);
+    for (int b : {BTN_LEFT, BTN_RIGHT, BTN_MIDDLE}) ioctl(fd, UI_SET_KEYBIT, b);
+    ioctl(fd, UI_SET_EVBIT, EV_ABS);
+    ioctl(fd, UI_SET_ABSBIT, ABS_X);
+    ioctl(fd, UI_SET_ABSBIT, ABS_Y);
+    abs_axis(fd, ABS_X, 0, 32767, 0, 0);
+    abs_axis(fd, ABS_Y, 0, 32767, 0, 0);
+    // Like a VM "USB tablet": libinput treats it as an absolute pointer.
+    if (!create_device(fd, "VRLayer Pointer", 0x1209, 0x5654, 1)) {
+        VRL_LOG("input", "failed to create virtual pointer");
+        ::close(fd);
+        return false;
+    }
+    fd_ = fd;
+    return true;
+}
+
+void UinputPointer::move_to(float u, float v) {
+    if (fd_ < 0) return;
+    int x = int(std::lround((u < 0 ? 0 : u > 1 ? 1 : u) * 32767.0f));
+    int y = int(std::lround((v < 0 ? 0 : v > 1 ? 1 : v) * 32767.0f));
+    if (x == last_x_ && y == last_y_) return;
+    emit(fd_, EV_ABS, ABS_X, x);
+    emit(fd_, EV_ABS, ABS_Y, y);
+    emit(fd_, EV_SYN, SYN_REPORT, 0);
+    last_x_ = x;
+    last_y_ = y;
+}
+
+void UinputPointer::button(int code, bool down) {
+    if (fd_ < 0) return;
+    emit(fd_, EV_KEY, code, down ? 1 : 0);
+    emit(fd_, EV_SYN, SYN_REPORT, 0);
+}
+
+void UinputPointer::close() {
+    if (fd_ < 0) return;
+    for (int b : {BTN_LEFT, BTN_RIGHT, BTN_MIDDLE}) emit(fd_, EV_KEY, b, 0);
+    emit(fd_, EV_SYN, SYN_REPORT, 0);
     ioctl(fd_, UI_DEV_DESTROY);
     ::close(fd_);
     fd_ = -1;

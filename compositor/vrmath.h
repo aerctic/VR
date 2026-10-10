@@ -16,6 +16,9 @@ inline float deg(float rad) { return rad * 180.0f / kPi; }
 inline float rad(float deg) { return deg * kPi / 180.0f; }
 
 Vec3 add(Vec3 a, Vec3 b);
+Vec3 sub(Vec3 a, Vec3 b);
+float dot(Vec3 a, Vec3 b);
+Quat conjugate(Quat q);  // inverse of a unit quaternion
 Vec3 scale(Vec3 v, float s);
 Quat mul(Quat a, Quat b);
 Quat normalize(Quat q);

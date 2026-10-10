@@ -1,6 +1,7 @@
 // Unit tests for the pieces that do not need a GPU or a headset.
 
 #include <fcntl.h>
+#include <linux/input-event-codes.h>
 #include <unistd.h>
 
 #include <cmath>
@@ -10,7 +11,11 @@
 #include <vector>
 
 #include "camera_math.h"
+#include "calibrator.h"
+#include "canvas.h"
 #include "config.h"
+#include "controls.h"
+#include "loading.h"
 #include "head_mouse.h"
 #include "ipc.h"
 #include "protocol.h"
@@ -37,6 +42,8 @@ static void test_protocol() {
     static_assert(sizeof(HelloMsg) == 16 + 16 + 32 + 8 + 128, "hello");
     static_assert(sizeof(SlotsMsg) == 16 + 48 + 16, "slots");
     static_assert(sizeof(FrameMsg) == 16 + 8 + 16 + 16 + 48, "frame");
+    static_assert(sizeof(AnalysisMsg) == 180 && sizeof(CameraMsg) == 64, "analysis / camera");
+    static_assert(offsetof(FrameMsg, cam_rot) == 56, "frame camera");
     static_assert(offsetof(SlotsMsg, color_alloc_size) % 8 == 0, "alignment");
     static_assert(offsetof(FrameMsg, frame_index) % 8 == 0, "alignment");
     EXPECT(depth_bytes_per_texel(DepthFormat::D16) == 2);
@@ -69,7 +76,7 @@ static void test_config() {
     EXPECT_NEAR(d.get_double("stereo.convergence", 0), 0.5, 1e-9);
 
     auto paths = profile_paths(1234);
-    EXPECT(paths.size() == 2 && paths[1].find("games/1234.ini") != std::string::npos);
+    EXPECT(paths.size() == 3 && paths[1].find("games/1234.auto.ini") != std::string::npos && paths[2].find("games/1234.ini") != std::string::npos);
     EXPECT(profile_paths(0).size() == 1);
 }
 
@@ -118,6 +125,11 @@ static void test_shipped_profile() {
         EXPECT(!ok || s.get(key) == defaults.get(key));
     }
     EXPECT(Settings::from_config(c).dump() == defaults.dump());
+    // Values the loading screen detects must not be pinned by the shipped
+    // profile, or detection could never apply them.
+    Settings shipped = Settings::from_config(c);
+    for (const char* auto_key : {"display.mode", "display.game_fov", "input.mouse_counts_per_degree"})
+        EXPECT(!shipped.is_explicit(auto_key));
 }
 
 
@@ -272,6 +284,172 @@ static void test_rigid_and_injection() {
     EXPECT(mat_near(cam2, yaw_matrix(30, 4, 5, 6), 1e-5f));
 }
 
+
+// Simulated game: camera yaw follows mouse counts with a lag of `lag` frames.
+struct SimGame {
+    float cpd = 12.5f;          // true counts per degree
+    float accel = 1.0f;         // >1: positive moves turn more (mouse acceleration)
+    bool responds = true;
+    int lag = 3;
+    std::vector<int> pending;   // counts queued for future frames
+    float yaw = 15.0f;
+    void push(int counts) { pending.push_back(counts); }
+    void frame(float rot[9]) {
+        if (int(pending.size()) > lag) {
+            int c = pending.front();
+            pending.erase(pending.begin());
+            if (responds) yaw -= float(c) / cpd * (c > 0 ? accel : 1.0f);  // mouse right = turn right
+        }
+        float r = rad(yaw);
+        const float m[9] = {std::cos(r), 0, std::sin(r), 0, 1, 0, -std::sin(r), 0, std::cos(r)};
+        memcpy(rot, m, sizeof(m));
+    }
+};
+
+static int run_calibration(SimGame& g, MouseCalibrator& cal, int* net_counts) {
+    cal.start(0.0, 400);
+    *net_counts = 0;
+    float rot[9];
+    int frames = 0;
+    for (; frames < 60 * 60 && cal.busy(); ++frames) {
+        g.frame(rot);
+        int c = cal.update(frames / 60.0, true, rot);
+        *net_counts += c;
+        g.push(c);
+    }
+    return frames;
+}
+
+static void test_calibrator() {
+    {
+        SimGame g;
+        MouseCalibrator cal;
+        int net;
+        run_calibration(g, cal, &net);
+        EXPECT(cal.state() == MouseCalibrator::State::Done);
+        EXPECT_NEAR(cal.counts_per_degree(), 12.5, 0.25);
+        EXPECT(net == 0);  // the camera ends where it started
+    }
+    {
+        SimGame g;
+        g.responds = false;
+        MouseCalibrator cal;
+        int net;
+        run_calibration(g, cal, &net);
+        EXPECT(cal.state() == MouseCalibrator::State::Failed);
+        EXPECT(cal.message().find("did not follow") != std::string::npos);
+        EXPECT(net == 0);
+    }
+    {
+        SimGame g;
+        g.accel = 1.6f;
+        MouseCalibrator cal;
+        int net;
+        run_calibration(g, cal, &net);
+        EXPECT(cal.state() == MouseCalibrator::State::Failed);
+        EXPECT(cal.message().find("symmetric") != std::string::npos);
+    }
+    {
+        // No camera at all: gives up instead of hanging.
+        MouseCalibrator cal;
+        cal.start(0.0);
+        float rot[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+        for (int i = 0; i < 60 * 20; ++i) cal.update(i / 60.0, false, rot);
+        EXPECT(cal.state() == MouseCalibrator::State::Failed);
+    }
+}
+
+static void test_controls() {
+    EXPECT(key_code("space") == KEY_SPACE && key_code("E") == KEY_E && key_code("f5") == KEY_F5);
+    EXPECT(key_code("0") == KEY_0 && key_code("9") == KEY_9 && key_code("mouse_left") == BTN_LEFT);
+    EXPECT(key_code("nonsense") == -1);
+    KeyboardMouseMapper m;
+    std::string err;
+    EXPECT(m.bind("a", "enter", &err));
+    EXPECT(!m.bind("a", "nope", &err));
+    EXPECT(!m.bind("nobutton", "e", &err));
+    GamepadState s;
+    s.ly = 1.0f;
+    s.a = true;
+    s.rt = 1.0f;
+    auto o = m.update(s, 0.016f, 120, 30);
+    EXPECT(o.pressed.count(KEY_W) && o.pressed.count(KEY_ENTER) && o.pressed.count(BTN_LEFT));
+    EXPECT(!o.pressed.count(KEY_S) && !o.pressed.count(KEY_SPACE));
+    // Snap turn fires once per flick.
+    s = GamepadState{};
+    s.rx = 0.9f;
+    EXPECT(m.update(s, 0.016f, 120, 30).look_yaw_deg == 30.0f);
+    EXPECT(m.update(s, 0.016f, 120, 30).look_yaw_deg == 0.0f);
+    s.rx = 0.0f;
+    m.update(s, 0.016f, 120, 30);
+    s.rx = -0.9f;
+    EXPECT(m.update(s, 0.016f, 120, 30).look_yaw_deg == -30.0f);
+    // Smooth turning scales with time.
+    s.rx = 1.0f;
+    EXPECT_NEAR(m.update(s, 0.5f, 120, 0).look_yaw_deg, 60.0, 1e-3);
+}
+
+static void test_loading_logic() {
+    Settings s;
+    LoadingInputs in;
+    LoadingView v = build_loading_view(in, s, -1);
+    EXPECT(!v.ready && v.subtitle.find("Waiting") != std::string::npos);
+
+    in.game = true;
+    in.game_name = "game.exe";
+    in.fps = 60;
+    in.uinput = true;
+    in.elapsed = 5;
+    v = build_loading_view(in, s, -1);
+    EXPECT(!v.ready && v.recommended == ViewMode::Theater);
+
+    in.has_analysis = true;
+    in.analysis.flags = kAnalysisProjection | kAnalysisView | kAnalysisDepth;
+    in.analysis.hfov_deg = 90;
+    in.calibration = MouseCalibrator::State::Turning;
+    v = build_loading_view(in, s, -1);
+    EXPECT(v.recommended == ViewMode::Vr && !v.ready);  // still calibrating
+
+    in.calibration = MouseCalibrator::State::Done;
+    v = build_loading_view(in, s, 5.0);
+    EXPECT(v.ready && v.recommended == ViewMode::Vr);
+    EXPECT(v.countdown > 4.9 && v.countdown <= 5.0);
+    in.elapsed = 12;
+    EXPECT(build_loading_view(in, s, 5.0).countdown == 0.0);
+
+    // Projection but no view: immersive when mouse look works, else theater.
+    in.analysis.flags = kAnalysisProjection;
+    EXPECT(build_loading_view(in, s, -1).recommended == ViewMode::Immersive);
+    in.calibration = MouseCalibrator::State::Failed;
+    EXPECT(build_loading_view(in, s, -1).recommended == ViewMode::Theater);
+
+    // Nothing found: ready only after the timeout.
+    in.has_analysis = false;
+    in.elapsed = 10;
+    EXPECT(!build_loading_view(in, s, -1).ready);
+    in.elapsed = s.loading_timeout + 1;
+    EXPECT(build_loading_view(in, s, -1).ready);
+
+    // Buttons.
+    EXPECT(loading_button_at(100.0f / kPanelWidth, 630.0f / kPanelHeight) == 0);
+    EXPECT(loading_button_at(800.0f / kPanelWidth, 630.0f / kPanelHeight) == 1);
+    EXPECT(loading_button_at(0.5f, 0.1f) == -1);
+}
+
+static void test_canvas() {
+    for (char ch : std::string("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,:-+/()%!?=_<>[]*#@abcxyz&"))
+        EXPECT(font_has_glyph(ch));
+    Canvas c(64, 16);
+    c.clear(0x000000FF);
+    int w = c.text(1, 1, "HI", 1, 0xFFFFFFFF);
+    EXPECT(w == 12 && Canvas::text_width("HI", 2) == 24);
+    // 'H' column 0 is lit on every row, column 1 only in the middle row.
+    auto px = [&](int x, int y) { return c.data()[(y * 64 + x) * 4]; };
+    EXPECT(px(1, 1) == 255 && px(1, 7) == 255 && px(2, 1) == 0 && px(2, 4) == 255);
+    c.fill_rect(0, 0, 4, 4, 0xFF000080);  // 50% red over black
+    EXPECT(std::abs(int(c.data()[0]) - 128) <= 1 && c.data()[1] == 0);
+}
+
 static void test_head_mouse() {
     EXPECT_NEAR(angle_diff_deg(10, 350), 20, 1e-4);
     EXPECT_NEAR(angle_diff_deg(350, 10), -20, 1e-4);
@@ -384,6 +562,10 @@ int main() {
     test_projection_detection();
     test_rigid_and_injection();
     test_ipc();
+    test_calibrator();
+    test_controls();
+    test_loading_logic();
+    test_canvas();
     fprintf(stderr, "%s: %d checks, %d failures\n", g_failures ? "FAILED" : "PASSED", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

@@ -342,6 +342,7 @@ void Analyzer::track() {
 
     std::vector<Hit> hits;
     bool found_camera = false;
+    ++track_count_;
     float rot[9], pos[3];
     {
         std::lock_guard<std::mutex> rl(regions_mtx_);
@@ -351,7 +352,16 @@ void Analyzer::track() {
                 if (reg.id == id) r = &reg;
             if (!r || !r->ptr) continue;
             size_t before = hits.size();
-            scan_for_anchor(*r, 0, r->size, &hits);
+            // Near the last hit most of the time (ring buffers advance slowly);
+            // the whole region now and then to recover.
+            VkDeviceSize cur = cursors.count(id) ? cursors[id] : 0;
+            if (track_count_ % 30 == 0 || r->size <= (8u << 20)) {
+                scan_for_anchor(*r, 0, r->size, &hits);
+            } else {
+                VkDeviceSize begin = cur > (256u << 10) ? cur - (256u << 10) : 0;
+                scan_for_anchor(*r, begin, begin + (8u << 20), &hits);
+                if (begin + (8u << 20) > r->size) scan_for_anchor(*r, 0, begin + (8u << 20) - r->size, &hits);
+            }
             for (size_t i = before; i < hits.size(); ++i) cursors[id] = std::max(cursors[id], hits[i].offset);
         }
         if (have_view) {

@@ -6,6 +6,9 @@ namespace vrl {
 
 Vec3 add(Vec3 a, Vec3 b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
 Vec3 scale(Vec3 v, float s) { return {v.x * s, v.y * s, v.z * s}; }
+Vec3 sub(Vec3 a, Vec3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
+float dot(Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+Quat conjugate(Quat q) { return {-q.x, -q.y, -q.z, q.w}; }
 
 Quat mul(Quat a, Quat b) {
     return {a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y, a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,

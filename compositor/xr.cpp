@@ -29,6 +29,7 @@ bool XrContext::init(std::string* error) {
     for (auto& e : exts) {
         if (!strcmp(e.extensionName, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME)) vk2 = true;
         if (!strcmp(e.extensionName, XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME)) cylinder_ = true;
+        if (!strcmp(e.extensionName, XR_EXT_HAND_TRACKING_EXTENSION_NAME)) hand_tracking_ = true;
     }
     if (!vk2) {
         if (error) *error = "OpenXR runtime lacks XR_KHR_vulkan_enable2 (is an OpenXR runtime such as Monado, "
@@ -37,6 +38,7 @@ bool XrContext::init(std::string* error) {
     }
     std::vector<const char*> enable{XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME};
     if (cylinder_) enable.push_back(XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME);
+    if (hand_tracking_) enable.push_back(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
 
     XrInstanceCreateInfo ici{XR_TYPE_INSTANCE_CREATE_INFO};
     snprintf(ici.applicationInfo.applicationName, XR_MAX_APPLICATION_NAME_SIZE, "VRLayer");
@@ -53,6 +55,22 @@ bool XrContext::init(std::string* error) {
     XrSystemGetInfo sgi{XR_TYPE_SYSTEM_GET_INFO};
     sgi.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
     XR_CHECK(xrGetSystem(instance_, &sgi, &system_), "xrGetSystem (is the headset connected?)");
+    if (hand_tracking_) {
+        XrSystemHandTrackingPropertiesEXT ht{XR_TYPE_SYSTEM_HAND_TRACKING_PROPERTIES_EXT};
+        XrSystemProperties sp{XR_TYPE_SYSTEM_PROPERTIES, &ht};
+        hand_tracking_ = XR_SUCCEEDED(xrGetSystemProperties(instance_, system_, &sp)) && ht.supportsHandTracking;
+    }
+    {
+        uint32_t nv = 0;
+        xrEnumerateViewConfigurationViews(instance_, system_, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &nv, nullptr);
+        std::vector<XrViewConfigurationView> vcv(nv, {XR_TYPE_VIEW_CONFIGURATION_VIEW});
+        xrEnumerateViewConfigurationViews(instance_, system_, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, nv, &nv,
+                                          vcv.data());
+        if (!vcv.empty() && vcv[0].recommendedImageRectWidth) {
+            eye_w_ = vcv[0].recommendedImageRectWidth;
+            eye_h_ = vcv[0].recommendedImageRectHeight;
+        }
+    }
 
     PFN_xrGetVulkanGraphicsRequirements2KHR get_reqs = nullptr;
     PFN_xrCreateVulkanInstanceKHR create_instance = nullptr;
@@ -141,8 +159,8 @@ bool XrContext::init(std::string* error) {
 
     VkPhysicalDeviceProperties pdp;
     vkGetPhysicalDeviceProperties(gpu_.physical, &pdp);
-    VRL_LOG("xr", "runtime '%s', GPU '%s', cylinder layers %s", runtime_name_.c_str(), pdp.deviceName,
-            cylinder_ ? "yes" : "no");
+    VRL_LOG("xr", "runtime '%s', GPU '%s', eye %ux%u, cylinder layers %s, hand tracking %s", runtime_name_.c_str(),
+            pdp.deviceName, eye_w_, eye_h_, cylinder_ ? "yes" : "no", hand_tracking_ ? "yes" : "no");
 
     // --- session + spaces
     XrGraphicsBindingVulkan2KHR binding{XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR};
@@ -161,19 +179,33 @@ bool XrContext::init(std::string* error) {
     XR_CHECK(xrCreateReferenceSpace(session_, &rsci, &local_), "xrCreateReferenceSpace(LOCAL)");
     rsci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
     XR_CHECK(xrCreateReferenceSpace(session_, &rsci, &view_), "xrCreateReferenceSpace(VIEW)");
+    uint32_t ns = 0;
+    xrEnumerateReferenceSpaces(session_, 0, &ns, nullptr);
+    std::vector<XrReferenceSpaceType> spaces(ns);
+    xrEnumerateReferenceSpaces(session_, ns, &ns, spaces.data());
+    for (auto t : spaces)
+        if (t == XR_REFERENCE_SPACE_TYPE_STAGE) {
+            rsci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
+            if (XR_FAILED(xrCreateReferenceSpace(session_, &rsci, &stage_))) stage_ = XR_NULL_HANDLE;
+        }
+
+    uint32_t nf = 0;
+    xrEnumerateSwapchainFormats(session_, 0, &nf, nullptr);
+    formats_.resize(nf);
+    xrEnumerateSwapchainFormats(session_, nf, &nf, formats_.data());
     return true;
 }
 
 void XrContext::destroy() {
     if (gpu_.device) vkDeviceWaitIdle(gpu_.device);
-    destroy_swapchain();
+    if (stage_) xrDestroySpace(stage_);
     if (view_) xrDestroySpace(view_);
     if (local_) xrDestroySpace(local_);
     if (session_) xrDestroySession(session_);
     if (gpu_.device) vkDestroyDevice(gpu_.device, nullptr);
     if (gpu_.instance) vkDestroyInstance(gpu_.instance, nullptr);
     if (instance_) xrDestroyInstance(instance_);
-    view_ = local_ = XR_NULL_HANDLE;
+    view_ = local_ = stage_ = XR_NULL_HANDLE;
     session_ = XR_NULL_HANDLE;
     instance_ = XR_NULL_HANDLE;
     gpu_ = Gpu{};
@@ -239,43 +271,57 @@ bool XrContext::locate_head(XrTime t, XrPosef* pose) {
     return true;
 }
 
-void XrContext::destroy_swapchain() {
-    if (swapchain_) xrDestroySwapchain(swapchain_);
-    swapchain_ = XR_NULL_HANDLE;
-    images_.clear();
-    sw_w_ = sw_h_ = 0;
+bool XrContext::locate_views(XrTime t, XrView views[2]) {
+    XrViewLocateInfo li{XR_TYPE_VIEW_LOCATE_INFO};
+    li.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    li.displayTime = t;
+    li.space = local_;
+    XrViewState vs{XR_TYPE_VIEW_STATE};
+    uint32_t n = 0;
+    views[0] = views[1] = XrView{XR_TYPE_VIEW};
+    if (XR_FAILED(xrLocateViews(session_, &li, &vs, 2, &n, views)) || n != 2) return false;
+    return (vs.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0;
 }
 
-bool XrContext::ensure_swapchain(uint32_t w, uint32_t h) {
-    if (swapchain_ && w == sw_w_ && h == sw_h_) return true;
-    vkQueueWaitIdle(gpu_.queue);
-    destroy_swapchain();
-
-    if (!sw_format_) {
-        uint32_t n = 0;
-        xrEnumerateSwapchainFormats(session_, 0, &n, nullptr);
-        std::vector<int64_t> formats(n);
-        xrEnumerateSwapchainFormats(session_, n, &n, formats.data());
-        const int64_t preferred[] = {VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_R16G16B16A16_SFLOAT};
-        for (int64_t p : preferred) {
-            for (int64_t f : formats)
-                if (f == p) sw_format_ = f;
-            if (sw_format_) break;
-        }
-        if (!sw_format_ && !formats.empty()) sw_format_ = formats[0];
-        VRL_DBG("xr", "swapchain format %lld", static_cast<long long>(sw_format_));
+float XrContext::floor_y(XrTime t) {
+    if (stage_) {
+        XrSpaceLocation loc{XR_TYPE_SPACE_LOCATION};
+        if (XR_SUCCEEDED(xrLocateSpace(stage_, local_, t, &loc)) &&
+            (loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT))
+            floor_y_ = loc.pose.position.y;
     }
+    return floor_y_;
+}
 
+// ---------------------------------------------------------------------------
+
+bool XrImageSwapchain::ensure(XrSession session, const std::vector<int64_t>& runtime_formats,
+                              const std::vector<int64_t>& prefs, uint32_t w, uint32_t h, VkQueue queue) {
+    if (swapchain_ && w == w_ && h == h_) return true;
+    if (swapchain_) {
+        vkQueueWaitIdle(queue);
+        destroy();
+    }
+    int64_t fmt = 0;
+    for (int64_t p : prefs) {
+        for (int64_t f : runtime_formats)
+            if (f == p) fmt = f;
+        if (fmt) break;
+    }
+    if (!fmt) {
+        if (runtime_formats.empty()) return false;
+        fmt = runtime_formats[0];
+    }
     XrSwapchainCreateInfo ci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
     ci.usageFlags = XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
-    ci.format = sw_format_;
+    ci.format = fmt;
     ci.sampleCount = 1;
     ci.width = w;
     ci.height = h;
     ci.faceCount = 1;
     ci.arraySize = 1;
     ci.mipCount = 1;
-    if (XR_FAILED(xrCreateSwapchain(session_, &ci, &swapchain_))) {
+    if (XR_FAILED(xrCreateSwapchain(session, &ci, &swapchain_))) {
         VRL_LOG("xr", "xrCreateSwapchain %ux%u failed", w, h);
         swapchain_ = XR_NULL_HANDLE;
         return false;
@@ -284,22 +330,30 @@ bool XrContext::ensure_swapchain(uint32_t w, uint32_t h) {
     xrEnumerateSwapchainImages(swapchain_, 0, &n, nullptr);
     images_.assign(n, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN2_KHR});
     xrEnumerateSwapchainImages(swapchain_, n, &n, reinterpret_cast<XrSwapchainImageBaseHeader*>(images_.data()));
-    sw_w_ = w;
-    sw_h_ = h;
+    w_ = w;
+    h_ = h;
+    format_ = fmt;
     return true;
 }
 
-VkImage XrContext::acquire_image() {
+void XrImageSwapchain::destroy() {
+    if (swapchain_) xrDestroySwapchain(swapchain_);
+    swapchain_ = XR_NULL_HANDLE;
+    images_.clear();
+    w_ = h_ = 0;
+}
+
+VkImage XrImageSwapchain::acquire() {
     uint32_t idx;
     XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-    if (XR_FAILED(xrAcquireSwapchainImage(swapchain_, &ai, &idx))) return VK_NULL_HANDLE;
+    if (!swapchain_ || XR_FAILED(xrAcquireSwapchainImage(swapchain_, &ai, &idx))) return VK_NULL_HANDLE;
     XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
     wi.timeout = XR_INFINITE_DURATION;
     if (XR_FAILED(xrWaitSwapchainImage(swapchain_, &wi))) return VK_NULL_HANDLE;
     return images_[idx].image;
 }
 
-void XrContext::release_image() {
+void XrImageSwapchain::release() {
     XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
     xrReleaseSwapchainImage(swapchain_, &ri);
 }

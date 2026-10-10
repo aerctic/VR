@@ -123,6 +123,7 @@ private:
     std::vector<uint64_t> hot_regions_;
     std::unordered_map<uint64_t, VkDeviceSize> cursor_;  // per hot region: last anchor seen
     uint32_t frames_without_hits_ = 0;
+    uint32_t track_count_ = 0;  // scanner thread only
     uint32_t last_hits_ = 0;
     // Camera.
     bool camera_valid_ = false;

@@ -1,0 +1,127 @@
+#version 450
+// Per-eye ray-traced VR scenery for projection layers:
+//   mode 0 (environment): sky gradient, horizon glow and a floor grid
+//   mode 1 (overlay):     hands, controllers, laser pointers and cursors as
+//                         spheres / capsules on a transparent background
+//                         (premultiplied alpha)
+// Output: both eyes side by side in one RGBA16F image (linear).
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(binding = 0, rgba16f) uniform writeonly image2D dst;
+
+struct Eye {
+    vec4 orientation;  // quaternion xyzw (eye -> world)
+    vec4 position;     // xyz
+    vec4 tan_lrud;     // tan of the left, right, up, down fov angles (left/down negative)
+};
+struct Prim {
+    vec4 a;      // xyz = centre / capsule start, w = radius
+    vec4 b;      // xyz = capsule end, w = type: 0 sphere, 1 capsule, 2 glowing capsule
+    vec4 color;  // linear rgb, a = opacity
+};
+layout(std430, binding = 1) readonly buffer Scene {
+    Eye eyes[2];
+    vec4 params;  // x = floor y, y = time, z = mode, w = primitive count
+    vec4 accent;  // grid / glow colour
+    Prim prims[];
+} scene;
+
+layout(push_constant) uniform PC { uvec2 eye_size; } pc;
+
+vec3 qrot(vec4 q, vec3 v) {
+    vec3 t = 2.0 * cross(q.xyz, v);
+    return v + q.w * t + cross(q.xyz, t);
+}
+
+float hit_sphere(vec3 ro, vec3 rd, vec3 c, float r, out vec3 n) {
+    vec3 oc = ro - c;
+    float b = dot(oc, rd);
+    float h = b * b - (dot(oc, oc) - r * r);
+    if (h < 0.0) return -1.0;
+    float t = -b - sqrt(h);
+    n = normalize(ro + rd * t - c);
+    return t;
+}
+
+float hit_capsule(vec3 ro, vec3 rd, vec3 pa, vec3 pb, float r, out vec3 n) {
+    vec3 ba = pb - pa, oa = ro - pa;
+    float baba = dot(ba, ba), bard = dot(ba, rd), baoa = dot(ba, oa);
+    float rdoa = dot(rd, oa), oaoa = dot(oa, oa);
+    float a = baba - bard * bard;
+    float b = baba * rdoa - baoa * bard;
+    float c = baba * oaoa - baoa * baoa - r * r * baba;
+    float h = b * b - a * c;
+    if (h < 0.0) return -1.0;
+    float t = (-b - sqrt(h)) / a;
+    float y = baoa + t * bard;
+    if (y <= 0.0 || y >= baba) {
+        // caps
+        vec3 oc = (y <= 0.0) ? oa : ro - pb;
+        b = dot(rd, oc);
+        c = dot(oc, oc) - r * r;
+        h = b * b - c;
+        if (h < 0.0) return -1.0;
+        t = -b - sqrt(h);
+    }
+    vec3 p = ro + rd * t;
+    vec3 q = clamp(dot(p - pa, ba) / baba, 0.0, 1.0) * ba + pa;
+    n = normalize(p - q);
+    return t;
+}
+
+vec3 environment(vec3 ro, vec3 rd) {
+    float floor_y = scene.params.x;
+    vec3 zenith = vec3(0.012, 0.016, 0.035), horizon = vec3(0.06, 0.07, 0.11);
+    vec3 col = mix(horizon, zenith, clamp(rd.y * 2.0, 0.0, 1.0));
+    col += scene.accent.rgb * 0.08 * exp(-abs(rd.y) * 18.0);  // horizon glow
+    if (rd.y < -1e-4 && ro.y > floor_y) {
+        float t = (floor_y - ro.y) / rd.y;
+        vec3 p = ro + rd * t;
+        vec2 g = abs(fract(p.xz + 0.5) - 0.5);
+        float w = 0.012 + t * 0.0015;  // widen with distance against aliasing
+        float line = 1.0 - smoothstep(0.0, w, min(g.x, g.y));
+        float fade = exp(-t * 0.08);
+        vec3 ground = vec3(0.015, 0.017, 0.024);
+        col = ground + scene.accent.rgb * line * 0.35 * fade;
+        // soft pad under the player
+        float r = length(p.xz - ro.xz);
+        col += scene.accent.rgb * 0.06 * (1.0 - smoothstep(0.4, 0.55, r));
+        col = mix(col, horizon, 1.0 - fade);
+    }
+    return col;
+}
+
+void main() {
+    uvec3 gid = gl_GlobalInvocationID;
+    if (gid.x >= pc.eye_size.x || gid.y >= pc.eye_size.y) return;
+    Eye e = scene.eyes[gid.z];
+    vec2 uv = (vec2(gid.xy) + 0.5) / vec2(pc.eye_size);
+    vec3 dir = normalize(vec3(mix(e.tan_lrud.x, e.tan_lrud.y, uv.x), mix(e.tan_lrud.z, e.tan_lrud.w, uv.y), -1.0));
+    vec3 rd = qrot(e.orientation, dir);
+    vec3 ro = e.position.xyz;
+    ivec2 px = ivec2(gid.x + gid.z * pc.eye_size.x, gid.y);
+
+    if (scene.params.z < 0.5) {
+        imageStore(dst, px, vec4(environment(ro, rd), 1.0));
+        return;
+    }
+
+    float best = 1e9;
+    vec4 out_c = vec4(0.0);
+    int count = int(scene.params.w);
+    for (int i = 0; i < count; ++i) {
+        Prim p = scene.prims[i];
+        vec3 n;
+        float t = p.b.w < 0.5 ? hit_sphere(ro, rd, p.a.xyz, p.a.w, n) : hit_capsule(ro, rd, p.a.xyz, p.b.xyz, p.a.w, n);
+        if (t <= 0.0 || t >= best) continue;
+        best = t;
+        vec3 c = p.color.rgb;
+        if (p.b.w < 1.5) {
+            float lambert = max(dot(n, normalize(vec3(0.3, 0.8, 0.4))), 0.0);
+            float rim = pow(1.0 - max(dot(n, -rd), 0.0), 3.0);
+            c = c * (0.3 + 0.7 * lambert) + rim * 0.25;
+        }
+        out_c = vec4(c * p.color.a, p.color.a);
+    }
+    imageStore(dst, px, out_c);
+}

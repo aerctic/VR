@@ -21,6 +21,7 @@ const uint FLAG_FLIP_Y = 4u;
 const uint FLAG_SRGB_DECODE = 8u;
 const uint FLAG_SHOW_DEPTH = 16u;
 const uint FLAG_HAS_DEPTH = 32u;
+const uint FLAG_EXACT_DEPTH = 64u;  // depth_a/depth_b from the detected projection
 
 layout(push_constant) uniform Params {
     uvec2 size;         // per-eye output size == source color size
@@ -32,6 +33,9 @@ layout(push_constant) uniform Params {
     float popout;       // max negative parallax as a fraction of separation
     float far_plane;    // depth linearization constant
     int steps;          // search steps per pixel
+    float depth_a;      // exact mode: distance = depth_b / (depth - depth_a)
+    float depth_b;
+    float conv_dist;    // exact mode: distance of the screen plane (game units)
 } pc;
 
 float raw_depth(vec2 uv) {
@@ -56,8 +60,16 @@ float linear_depth(vec2 uv) {
 
 // Horizontal parallax in uv units. Positive = behind the screen plane.
 float parallax(vec2 uv) {
-    float z = max(linear_depth(uv), 1e-5);
-    float p = pc.separation * (1.0 - pc.convergence / z);
+    float p;
+    if ((pc.flags & FLAG_EXACT_DEPTH) != 0u) {
+        float d = raw_depth(uv) - pc.depth_a;
+        float dist = abs(d) < 1e-9 ? 1e30 : pc.depth_b / d;  // view distance in game units
+        dist = dist <= 0.0 ? 1e30 : dist;                      // sky / cleared depth = infinitely far
+        p = pc.separation * (1.0 - pc.conv_dist / dist);
+    } else {
+        float z = max(linear_depth(uv), 1e-5);
+        p = pc.separation * (1.0 - pc.convergence / z);
+    }
     return clamp(p, -pc.separation * pc.popout, pc.separation);
 }
 
@@ -132,7 +144,13 @@ void main() {
 
     vec3 c;
     if ((pc.flags & FLAG_SHOW_DEPTH) != 0u && has_depth) {
-        c = vec3(pow(linear_depth(src), 0.25));
+        if ((pc.flags & FLAG_EXACT_DEPTH) != 0u) {
+            float d = raw_depth(src) - pc.depth_a;
+            float dist = abs(d) < 1e-9 ? 1e30 : pc.depth_b / d;
+            c = vec3(dist <= 0.0 ? 1.0 : clamp(log2(max(dist / pc.conv_dist, 1e-3)) / 10.0 + 0.5, 0.0, 1.0));
+        } else {
+            c = vec3(pow(linear_depth(src), 0.25));
+        }
     } else {
         c = textureLod(src_color, src, 0.0).rgb;
         if ((pc.flags & FLAG_SRGB_DECODE) != 0u) c = srgb_to_linear(clamp(c, 0.0, 1.0));
