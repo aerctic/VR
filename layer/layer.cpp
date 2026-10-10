@@ -735,7 +735,11 @@ static void end_pass(DeviceData* dev, VkCommandBuffer cb) {
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = image;
     b.subresourceRange = {barrier_aspect, mip, 1, layer, 1};
-    dev->d.CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+    // TRANSFER in the source scope also orders this copy after the previous
+    // frame's present-time read of the staging buffer (write-after-read).
+    dev->d.CmdPipelineBarrier(cb,
+                              VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                                  VK_PIPELINE_STAGE_TRANSFER_BIT,
                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
 
     VkBufferImageCopy region{};

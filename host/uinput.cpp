@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <linux/uinput.h>
 #include <sys/ioctl.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -28,9 +29,21 @@ static void emit(int fd, int type, int code, int value) {
 }
 
 static int open_uinput() {
+    // Callers retry every frame while the device is wanted; keep that cheap
+    // and quiet when /dev/uinput is not accessible.
+    static timespec last_fail{};
+    static bool logged = false;
+    timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (last_fail.tv_sec && now.tv_sec - last_fail.tv_sec < 5) return -1;
     int fd = ::open("/dev/uinput", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
-    if (fd < 0) VRL_LOG("input", "cannot open /dev/uinput (%s); install packaging/70-vrlayer-uinput.rules",
-                        strerror(errno));
+    if (fd < 0) {
+        last_fail = now;
+        if (!logged)
+            VRL_LOG("input", "cannot open /dev/uinput (%s): head mouse and gamepad disabled; "
+                    "install packaging/70-vrlayer-uinput.rules", strerror(errno));
+        logged = true;
+    }
     return fd;
 }
 

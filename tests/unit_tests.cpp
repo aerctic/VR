@@ -99,6 +99,26 @@ static void test_settings() {
     EXPECT(t.dump() == s.dump());
 }
 
+static void test_shipped_profile() {
+    // Every key in the shipped default profile must be a real setting, and its
+    // values must match the built-in defaults so docs and code never disagree.
+    Config c;
+    std::string err;
+    EXPECT(c.load_file(std::string(VRLAYER_SOURCE_DIR) + "/profiles/default.ini", &err));
+    Settings defaults;
+    for (auto& [key, value] : c.values()) {
+        Settings s;
+        bool ok = s.set(key, value, &err);
+        if (!ok) fprintf(stderr, "  bad key in default.ini: %s (%s)\n", key.c_str(), err.c_str());
+        EXPECT(ok);
+        if (ok && s.get(key) != defaults.get(key))
+            fprintf(stderr, "  default.ini %s = %s, built-in %s\n", key.c_str(), s.get(key).c_str(),
+                    defaults.get(key).c_str());
+        EXPECT(!ok || s.get(key) == defaults.get(key));
+    }
+    EXPECT(Settings::from_config(c).dump() == defaults.dump());
+}
+
 static void test_head_mouse() {
     EXPECT_NEAR(angle_diff_deg(10, 350), 20, 1e-4);
     EXPECT_NEAR(angle_diff_deg(350, 10), -20, 1e-4);
@@ -205,6 +225,7 @@ int main() {
     test_protocol();
     test_config();
     test_settings();
+    test_shipped_profile();
     test_head_mouse();
     test_math();
     test_ipc();

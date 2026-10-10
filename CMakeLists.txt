@@ -13,8 +13,13 @@ option(VRLAYER_BUILD_LAYER "Build the Vulkan capture layer" ON)
 option(VRLAYER_BUILD_COMPOSITOR "Build the OpenXR compositor and tools" ON)
 option(VRLAYER_BUILD_TESTS "Build tests" ON)
 
-find_package(Vulkan REQUIRED)
 find_package(Threads REQUIRED)
+# The layer only needs the headers (so a 32-bit layer builds without a 32-bit
+# loader); the host side links the Vulkan loader.
+find_path(VULKAN_HEADERS_DIR vulkan/vk_layer.h REQUIRED)
+if(VRLAYER_BUILD_COMPOSITOR OR VRLAYER_BUILD_TESTS)
+  find_package(Vulkan REQUIRED)
+endif()
 
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
   set(VRLAYER_ARCH x86_64)
@@ -36,7 +41,8 @@ set_target_properties(vrlayer_common PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # ---------------------------------------------------------------------------
 if(VRLAYER_BUILD_LAYER)
   add_library(VkLayer_vrlayer SHARED layer/layer.cpp layer/capture.cpp)
-  target_link_libraries(VkLayer_vrlayer PRIVATE vrlayer_common Vulkan::Headers Threads::Threads)
+  target_include_directories(VkLayer_vrlayer PRIVATE ${VULKAN_HEADERS_DIR})
+  target_link_libraries(VkLayer_vrlayer PRIVATE vrlayer_common Threads::Threads)
   set_target_properties(VkLayer_vrlayer PROPERTIES CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)
   # The layer is injected into arbitrary processes (including the Steam Linux
   # Runtime container), so do not depend on the host's libstdc++.
@@ -113,6 +119,7 @@ if(VRLAYER_BUILD_COMPOSITOR)
     compositor/vrmath.cpp)
   target_include_directories(vrlayer-compositor PRIVATE compositor)
   target_link_libraries(vrlayer-compositor PRIVATE vrlayer_host PkgConfig::OPENXR)
+  target_compile_definitions(vrlayer-compositor PRIVATE VRLAYER_DATADIR="${CMAKE_INSTALL_FULL_DATADIR}/vrlayer")
 
   add_executable(vrlayer-ctl tools/vrlayer-ctl.cpp)
   target_link_libraries(vrlayer-ctl PRIVATE vrlayer_common)
@@ -132,6 +139,7 @@ if(VRLAYER_BUILD_TESTS)
   add_executable(vrlayer_unit_tests tests/unit_tests.cpp compositor/vrmath.cpp)
   target_include_directories(vrlayer_unit_tests PRIVATE compositor)
   target_link_libraries(vrlayer_unit_tests PRIVATE vrlayer_host)
+  target_compile_definitions(vrlayer_unit_tests PRIVATE VRLAYER_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
   add_test(NAME unit COMMAND vrlayer_unit_tests)
 
   if(VRLAYER_BUILD_LAYER)
@@ -150,7 +158,14 @@ if(VRLAYER_BUILD_TESTS)
         add_test(NAME e2e_${transport}_${api}
                  COMMAND vrlayer_e2e_test $<TARGET_FILE:vrlayer_test_game> ${CMAKE_BINARY_DIR}/devroot
                          ${transport} ${api})
+        set_tests_properties(e2e_${transport}_${api} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
       endforeach()
     endforeach()
+
+    if(VRLAYER_BUILD_COMPOSITOR)
+      # Full pipeline through a real OpenXR runtime (Monado's simulated HMD).
+      add_test(NAME xr_smoke COMMAND ${CMAKE_SOURCE_DIR}/tests/xr_smoke.sh ${CMAKE_BINARY_DIR})
+      set_tests_properties(xr_smoke PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    endif()
   endif()
 endif()

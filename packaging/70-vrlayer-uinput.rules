@@ -1,0 +1,7 @@
+# Let the logged-in user create virtual input devices (head-tracked mouse and
+# the emulated gamepad used by vrlayer-compositor).
+#
+# Install:  sudo cp 70-vrlayer-uinput.rules /etc/udev/rules.d/
+#           sudo udevadm control --reload && sudo udevadm trigger --name-match=uinput
+# (Steam's steam-devices package ships an equivalent rule.)
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"

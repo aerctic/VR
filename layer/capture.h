@@ -94,6 +94,17 @@ private:
     uint32_t color_mem_type_ = 0;
     uint32_t depth_mem_type_ = 0;
     uint64_t frame_counter_ = 0;
+    // Configuration whose slot creation failed; not retried until it changes.
+    struct FailedConfig {
+        uint64_t serial;
+        VkFormat format;
+        VkExtent2D extent;
+        DepthFormat depth;
+        uint32_t generation;
+    };
+    uint32_t connection_generation_ = 0;
+    bool have_failed_ = false;
+    FailedConfig failed_{};
     Slot slots_[kMaxSlots];
     std::mutex slot_mtx_;  // guards Slot::state
 

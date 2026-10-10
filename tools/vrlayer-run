@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Launch a game with VRLayer.
+#
+# Steam: right click the game -> Properties -> Launch Options:
+#     vrlayer-run %command%
+#
+# Outside Steam:
+#     vrlayer-run ./game
+#
+# Starts vrlayer-compositor if it is not running yet, then runs the game with
+# the capture layer enabled. Extra settings for this run can be passed as
+# environment variables, e.g.  VRLAYER_DEPTH=0 vrlayer-run %command%
+#
+#   VRLAYER_DEPTH=0          do not capture depth (no 3D, lowest overhead)
+#   VRLAYER_TRANSPORT=cpu    force the cpu copy path (multi-GPU setups)
+#   VRLAYER_NO_COMPOSITOR=1  do not auto-start the compositor
+#   VRLAYER_DEBUG=1          verbose logging
+
+set -u
+
+if [ "$#" -eq 0 ]; then
+    sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+    exit 2
+fi
+
+here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+ctl="$here/vrlayer-ctl"
+compositor="$here/vrlayer-compositor"
+[ -x "$ctl" ] || ctl="vrlayer-ctl"
+[ -x "$compositor" ] || compositor="vrlayer-compositor"
+
+if [ -z "${VRLAYER_NO_COMPOSITOR:-}" ] && ! "$ctl" ping >/dev/null 2>&1; then
+    log_dir="${XDG_STATE_HOME:-$HOME/.local/state}/vrlayer"
+    mkdir -p "$log_dir"
+    # Detach fully so the compositor outlives the game and Steam's process tracking.
+    setsid "$compositor" >"$log_dir/compositor.log" 2>&1 < /dev/null &
+    for _ in $(seq 1 50); do
+        "$ctl" ping >/dev/null 2>&1 && break
+        sleep 0.1
+    done
+    "$ctl" ping >/dev/null 2>&1 ||
+        echo "vrlayer-run: compositor did not start, see $log_dir/compositor.log (the game still starts)" >&2
+fi
+
+export ENABLE_VRLAYER=1
+exec "$@"

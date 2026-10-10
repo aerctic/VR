@@ -142,6 +142,7 @@ void Capture::poll_connection() {
                 if (transport_ == Transport::Gpu && !dev_->external_memory_fd) transport_ = Transport::Cpu;
                 conn_ = Conn::Ready;
                 slot_count_ = 0;  // force (re)creation + Slots message
+                ++connection_generation_;  // a new compositor may accept what the old one did not
                 VRL_LOG("layer", "connected to compositor (%s transport)",
                         transport_ == Transport::Gpu ? "gpu" : "cpu");
                 break;
@@ -436,8 +437,18 @@ bool Capture::on_present(VkQueue queue, const VkPresentInfoKHR* info, VkSemaphor
                                            depth.extent.height != depth_extent_.height));
     if (slot_count_ == 0 || serial != sc_serial_ || format != format_ || extent.width != extent_.width ||
         extent.height != extent_.height || depth_changed) {
+        const DepthFormat want_depth = depth.buffer ? depth.format : DepthFormat::None;
+        if (have_failed_ && failed_.serial == serial && failed_.format == format &&
+            failed_.extent.width == extent.width && failed_.extent.height == extent.height &&
+            failed_.depth == want_depth && failed_.generation == connection_generation_)
+            return false;  // already failed for exactly this setup
         sc_serial_ = serial;
-        if (!create_slots(format, extent, depth)) return false;
+        if (!create_slots(format, extent, depth)) {
+            have_failed_ = true;
+            failed_ = {serial, format, extent, want_depth, connection_generation_};
+            return false;
+        }
+        have_failed_ = false;
     }
 
     Slot* slot = nullptr;

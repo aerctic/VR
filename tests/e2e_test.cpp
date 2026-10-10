@@ -87,7 +87,7 @@ int main(int argc, char** argv) {
     std::string err;
     if (!Gpu::create_headless(&gpu, &err)) {
         fprintf(stderr, "SKIP: no Vulkan device (%s)\n", err.c_str());
-        return 77;
+        return 77;  // ctest: skipped
     }
 
     std::string sock = "vrlayer-test-" + std::to_string(getpid());
