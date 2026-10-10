@@ -92,14 +92,76 @@ const AnalysisMsg* App::analysis() const {
     return c && c->has_analysis ? &c->analysis : nullptr;
 }
 
-bool App::vr_available() const {
+bool App::camera_found() const {
     const AnalysisMsg* a = analysis();
     return a && (a->flags & kAnalysisProjection) && (a->flags & kAnalysisView);
 }
 
+uint32_t App::camera_id() const {
+    const AnalysisMsg* a = analysis();
+    return a && (a->flags & kAnalysisProjection) ? a->camera_id : 0;
+}
+
+bool App::probe_possible() const { return uinput_ok_ && settings_.calibrate_mouse; }
+
+bool App::camera_confirmed() const {
+    return camera_found() && (confirmed_camera_id_ == camera_id() || !probe_possible());
+}
+
+// VR needs the gameplay camera: a main menu's 3D background camera is found
+// just as well, but writing the head pose into it is pointless.
+bool App::vr_available() const { return camera_confirmed(); }
+
 bool App::cpd_known() const {
-    return settings_.is_explicit("input.mouse_counts_per_degree") ||
+    return settings_.is_explicit("input.mouse_counts_per_degree") || cpd_measured_ ||
            calibrator_.state() == MouseCalibrator::State::Done;
+}
+
+void App::reset_probe() {
+    calibrator_.cancel();
+    calibration_started_ = false;
+    probe_retry_at_ = -1;
+    probed_camera_id_ = 0;
+    panel_dirty_ = true;
+}
+
+// Runs in both phases. Whenever the tracked camera is not known to follow the
+// player, nudge the mouse (then the right stick) and watch it. Failures
+// (still in the main menu, a cutscene) are retried every few seconds, and a
+// new camera (menu -> level) starts a new check.
+void App::update_gameplay_probe(double now) {
+    const uint32_t id = camera_id();
+    if (id != probed_camera_id_) {
+        if (calibrator_.busy() || calibration_started_) VRL_LOG("compositor", "game camera changed, checking it again");
+        calibrator_.cancel();
+        calibration_started_ = false;
+        probe_retry_at_ = -1;
+        probed_camera_id_ = id;
+        panel_dirty_ = true;
+    }
+    if (!server_->active() || !camera_found() || !probe_possible()) return;
+    if (calibrator_.gameplay_confirmed() && confirmed_camera_id_ != id) {
+        confirmed_camera_id_ = id;
+        VRL_LOG("compositor", "gameplay confirmed: %s", calibrator_.message().c_str());
+        panel_dirty_ = true;
+    }
+    if (calibrator_.state() == MouseCalibrator::State::Done && !settings_.is_explicit("input.mouse_counts_per_degree")) {
+        settings_.mouse_counts_per_degree = calibrator_.counts_per_degree();
+        cpd_measured_ = true;
+    }
+    const bool confirmed = confirmed_camera_id_ == id;
+    // In play, a confirmed camera is left alone (no surprise mouse nudges).
+    if (confirmed && (phase_ == Phase::Playing || calibration_started_)) return;
+    if (calibrator_.state() == MouseCalibrator::State::Failed && !calibrator_.gameplay_confirmed()) {
+        if (probe_retry_at_ < 0) probe_retry_at_ = now + 4.0;
+        if (now >= probe_retry_at_) calibration_started_ = false;  // try again (did you load a save?)
+    }
+    if (!calibration_started_ && !calibrator_.busy()) {
+        calibrator_.start(now);
+        calibration_started_ = true;
+        probe_retry_at_ = -1;
+        panel_dirty_ = true;
+    }
 }
 
 bool App::aim_with_head() const {
@@ -145,7 +207,9 @@ std::string App::status() const {
               << ((a->flags & kAnalysisInjecting) ? ", injecting (" + std::to_string(a->patched) + "/frame)" : "")
               << "\n";
     }
-    if (calibrator_.state() != MouseCalibrator::State::Idle) o << "mouse calibration: " << calibrator_.message() << "\n";
+    if (camera_found())
+        o << "gameplay: " << (camera_confirmed() ? "confirmed" : "not confirmed (main menu?)") << "\n";
+    if (calibrator_.state() != MouseCalibrator::State::Idle) o << "gameplay check: " << calibrator_.message() << "\n";
     const ViewMode m = effective_mode();
     o << "mode: " << (m == ViewMode::Theater ? "theater" : m == ViewMode::Immersive ? "immersive" : "vr")
       << (settings_.mode == ViewMode::Vr && m != ViewMode::Vr ? " (vr unavailable: camera not found)" : "")
@@ -172,22 +236,32 @@ std::string App::handle_command(const std::string& line) {
     if (cmd == "continue") {
         if (phase_ != Phase::Loading) return "already playing";
         start_playing(a.empty() ? loading_view_.recommended
-                                : a == "vr" ? ViewMode::Vr : a == "immersive" ? ViewMode::Immersive : ViewMode::Theater);
+                                : a == "vr" ? ViewMode::Vr : a == "immersive" ? ViewMode::Immersive : ViewMode::Theater,
+                      a != "theater");
         return "playing";
     }
     if (cmd == "loading") {
         enter_loading(a == "reanalyze");
         return "loading screen";
     }
-    if (cmd == "analyze") {
+    if (cmd == "analyze" || cmd == "rescan") {
         server_->restart_analysis();
-        return "analysis restarted";
+        confirmed_camera_id_ = 0;
+        reset_probe();
+        return "searching the game camera again";
+    }
+    if (cmd == "gameplay") {  // "I am in gameplay": trust the current camera
+        if (!camera_found()) return "error: no camera found yet";
+        confirmed_camera_id_ = camera_id();
+        return "camera confirmed as gameplay";
     }
     if (cmd == "calibrate") {
         if (!uinput_ok_) return "error: no access to /dev/uinput";
-        if (!vr_available()) return "error: the game camera has not been found yet";
+        if (!camera_found()) return "error: the game camera has not been found yet";
+        cpd_measured_ = false;
         calibrator_.start(now_s());
         calibration_started_ = true;
+        probed_camera_id_ = camera_id();
         return "calibrating mouse look: stand still in game";
     }
     if (cmd == "mode") {
@@ -197,7 +271,9 @@ std::string App::handle_command(const std::string& line) {
         }
         std::string err;
         if (!settings_.set("display.mode", a, &err)) return "error: " + err;
-        if (settings_.mode == ViewMode::Vr && !vr_available()) return "mode vr requested, but the camera was not found: showing theater";
+        if (settings_.mode == ViewMode::Vr && !vr_available())
+            return camera_found() ? "mode vr: waiting for the camera to follow your controls (gameplay check), showing theater"
+                                  : "mode vr requested, but the camera was not found: showing theater";
         need_recenter_ = true;
         return "mode " + a;
     }
@@ -254,28 +330,30 @@ void App::enter_loading(bool restart_analysis) {
     phase_ = Phase::Loading;
     loading_start_ = now_s();
     ready_since_ = -1;
-    calibrator_.cancel();
-    calibration_started_ = false;
+    reset_probe();
     head_mouse_.stop();
     need_recenter_ = true;
     panel_dirty_ = true;
     if (restart_analysis && server_) server_->restart_analysis();
 }
 
-void App::start_playing(ViewMode choice) {
+void App::start_playing(ViewMode choice, bool vouch) {
+    if (vouch && camera_found()) confirmed_camera_id_ = camera_id();
     // Detected values fill in whatever the profiles did not set.
     if (const AnalysisMsg* a = analysis()) {
         if ((a->flags & kAnalysisProjection) && !settings_.is_explicit("display.game_fov")) settings_.game_fov = a->hfov_deg;
     }
-    if (calibrator_.state() == MouseCalibrator::State::Done && !settings_.is_explicit("input.mouse_counts_per_degree"))
+    if (calibrator_.state() == MouseCalibrator::State::Done && !settings_.is_explicit("input.mouse_counts_per_degree")) {
         settings_.mouse_counts_per_degree = calibrator_.counts_per_degree();
+        cpd_measured_ = true;
+    }
     write_auto_profile();
     // An explicit mode in the profile wins over the recommendation.
     if (!settings_.is_explicit("display.mode")) settings_.mode = choice;
     else if (choice == ViewMode::Theater && loading_view_.recommended != ViewMode::Theater) settings_.mode = choice;
     phase_ = Phase::Playing;
     need_recenter_ = true;
-    calibrator_.cancel();
+    if (calibrator_.busy() && camera_confirmed()) reset_probe();
     const ViewMode m = effective_mode();
     VRL_LOG("compositor", "starting in %s mode", mode_name(m));
 }
@@ -299,18 +377,13 @@ void App::update_loading(double now) {
     in.calibration = calibrator_.state();
     in.calibration_message = calibrator_.message();
     in.calibration_from_profile = settings_.is_explicit("input.mouse_counts_per_degree");
+    in.gameplay_confirmed = camera_found() && confirmed_camera_id_ == camera_id();
+    in.probe_possible = probe_possible();
     in.uinput = uinput_ok_;
     in.hand_tracking = hands_.available();
     in.hands_visible = hands_.hand(0).valid || hands_.hand(1).valid;
     in.controllers = controllers_seen_;
 
-    // Start mouse calibration once the camera can be watched.
-    if (c && settings_.calibrate_mouse && uinput_ok_ && vr_available() && !in.calibration_from_profile &&
-        !calibration_started_) {
-        calibrator_.start(now);
-        calibration_started_ = true;
-        in.calibration = calibrator_.state();
-    }
 
     LoadingView v = build_loading_view(in, settings_, ready_since_);
     if (v.ready && ready_since_ < 0) {
@@ -322,7 +395,7 @@ void App::update_loading(double now) {
     // Redraw the panel a few times per second (and immediately on input changes).
     if (panel_drawn_at_ < 0 || now - panel_drawn_at_ > 0.2) panel_dirty_ = true;
 
-    if (c && v.ready && settings_.auto_continue && v.countdown == 0.0) start_playing(v.recommended);
+    if (c && v.ready && settings_.auto_continue && v.countdown == 0.0) start_playing(v.auto_mode);
 }
 
 void App::recenter(const XrPosef& head) {
@@ -456,7 +529,9 @@ void App::update_pointer(const XrInput::Result& in, bool trigger_left, bool trig
         if (target == Screen) pointer_.button(BTN_LEFT, true);
     } else if (!trigger && pointer_down_) {
         if (pressed_button_ >= 0 && pressed_button_ == hovered_button_ && phase_ == Phase::Loading) {
-            start_playing(pressed_button_ == 0 ? loading_view_.recommended : ViewMode::Theater);
+            if (pressed_button_ == kButtonRescan) handle_command("rescan");
+            else if (pressed_button_ == kButtonStart) start_playing(loading_view_.recommended, true);
+            else start_playing(ViewMode::Theater);
         }
         pressed_button_ = -1;
         pointer_.button(BTN_LEFT, false);
@@ -497,7 +572,10 @@ void App::update_input(double now, float dt, bool head_ok, XrTime time) {
 
     // Game controls.
     const bool kbm = settings_.scheme == "keyboard_mouse";
-    if (game && settings_.gamepad && !kbm) {
+    // The gameplay probe may hold the right stick for a moment.
+    const bool probe_stick = calibrator_.busy() && calibrator_.stick_x() != 0.0f;
+    if (probe_stick) pad.rx = calibrator_.stick_x();
+    if (game && ((settings_.gamepad && !kbm) || probe_stick)) {
         if (!pad_.is_open()) pad_.open();
         pad_.update(pad);
     } else if (pad_.is_open()) {
@@ -688,6 +766,9 @@ int App::run() {
         vr_eye_valid_[0] = vr_eye_valid_[1] = false;
         camera_sent_on_ = false;
         pose_history_.clear();
+        confirmed_camera_id_ = 0;
+        cpd_measured_ = false;
+        reset_probe();
         if (!c || settings_.loading) {
             enter_loading(false);
         } else {
@@ -725,6 +806,7 @@ int App::run() {
         update_input(now, dt, head_ok_, fs.predictedDisplayTime);
         update_camera_injection(head_ok_);
         server_->poll(0);  // pick up the newest game frame as late as possible
+        update_gameplay_probe(now);
         if (phase_ == Phase::Loading) update_loading(now);
 
         layers_.clear();

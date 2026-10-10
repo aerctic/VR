@@ -12,6 +12,8 @@ constexpr double kStillTime = 0.35;     // seconds the camera must be still
 constexpr double kPhaseTimeout = 3.0;   // seconds to wait for a reaction
 constexpr float kMinTurnDeg = 0.5f;     // smaller turns mean "no mouse look"
 constexpr int kMaxAttempts = 3;
+constexpr float kStickProbe = 0.6f;     // right stick deflection for the controller test
+constexpr double kStickMaxHold = 0.8;   // seconds
 }  // namespace
 
 float rotation_delta_deg(const float a[9], const float b[9]) {
@@ -30,7 +32,9 @@ void MouseCalibrator::start(double now, int counts) {
     still_since_ = now;
     have_prev_ = false;
     cpd_ = 0;
-    message_ = "hold still: measuring mouse look";
+    stick_x_ = 0;
+    responded_ = false;
+    message_ = "hold still: checking that the camera follows your controls";
 }
 
 void MouseCalibrator::fail(const std::string& why) {
@@ -38,8 +42,10 @@ void MouseCalibrator::fail(const std::string& why) {
         message_ = why + " - retrying";
         state_ = State::WaitStill;
         have_prev_ = false;
+        stick_x_ = 0;
         return;
     }
+    stick_x_ = 0;
     state_ = State::Failed;
     message_ = why;
 }
@@ -72,7 +78,7 @@ int MouseCalibrator::update(double now, bool valid, const float rot[9]) {
             }
             if (now - phase_start_ > kPhaseTimeout * 3) {
                 state_ = State::Failed;
-                message_ = "camera never stopped moving (stand still in game)";
+                message_ = "camera keeps moving on its own (main menu or cutscene?)";
             }
             return 0;
         case State::Turning: {
@@ -87,9 +93,42 @@ int MouseCalibrator::update(double now, bool valid, const float rot[9]) {
             }
             if (now - phase_start_ > kPhaseTimeout) {
                 phase_start_ = now;
-                fail(a < kMinTurnDeg ? "camera did not follow the mouse (not a mouse-look view?)"
-                                     : "camera kept moving after the mouse turn");
+                if (a < kMinTurnDeg) {
+                    // Mouse ignored: try the controller's right stick.
+                    memcpy(ref_, rot, sizeof(ref_));
+                    state_ = State::StickTurning;
+                    stick_x_ = kStickProbe;
+                    message_ = "mouse ignored, trying the controller";
+                } else {
+                    responded_ = true;
+                    fail("camera kept moving after the mouse turn");
+                }
                 return -counts_;  // undo the test movement
+            }
+            if (a >= kMinTurnDeg) responded_ = true;
+            return 0;
+        }
+        case State::StickTurning: {
+            float a = rotation_delta_deg(ref_, rot);
+            if (a >= 2.0f || now - phase_start_ > kStickMaxHold) {
+                stick_held_ = now - phase_start_;
+                stick_x_ = -kStickProbe;  // turn back for as long as we turned
+                state_ = State::StickReturning;
+                first_angle_ = a;
+                phase_start_ = now;
+            }
+            return 0;
+        }
+        case State::StickReturning: {
+            if (now - phase_start_ < stick_held_) return 0;
+            stick_x_ = 0;
+            if (first_angle_ >= kMinTurnDeg) {
+                state_ = State::DoneStick;
+                responded_ = true;
+                message_ = "camera follows the controller (no mouse look)";
+            } else {
+                phase_start_ = now;
+                fail("camera ignores the mouse and the controller (main menu?)");
             }
             return 0;
         }

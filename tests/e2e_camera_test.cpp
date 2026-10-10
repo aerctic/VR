@@ -4,7 +4,10 @@
 // camera, and that a head pose sent by the compositor really changes what the
 // GPU renders (the game encodes the yaw its shader saw in the green channel).
 //
-// usage: vrlayer_e2e_camera_test <test_game> <data dir> gpu|cpu
+// With "menu" the game first shows a main menu with its own 3D camera; the
+// layer must move on to the gameplay camera once the level is loaded.
+//
+// usage: vrlayer_e2e_camera_test <test_game> <data dir> gpu|cpu [menu]
 
 #include <fcntl.h>
 #include <signal.h>
@@ -122,6 +125,7 @@ int main(int argc, char** argv) {
         fprintf(stderr, "usage: %s <test_game> <data dir> gpu|cpu\n", argv[0]);
         return 2;
     }
+    const bool menu = argc > 4 && !strcmp(argv[4], "menu");
     Harness h;
     std::string err;
     if (!Gpu::create_headless(&h.gpu, &err)) {
@@ -160,7 +164,7 @@ int main(int argc, char** argv) {
         dup2(pipefd[1], STDOUT_FILENO);
         dup2(pipefd[1], STDERR_FILENO);
         close(pipefd[0]);
-        execl(argv[1], argv[1], "renderpass", "camera", nullptr);
+        execl(argv[1], argv[1], "renderpass", menu ? "menu" : "camera", nullptr);
         _exit(127);
     }
     close(pipefd[1]);
@@ -173,11 +177,28 @@ int main(int argc, char** argv) {
     const int green_90 = 128;                                                // after +70 deg injection
     auto near_green = [](int g, int want) { return std::abs(g - want) <= 2; };
 
+    // 0. Main menu: its camera is found first, then replaced by the gameplay
+    //    camera when the level loads (its copies stay behind in memory).
+    uint32_t menu_id = 0;
+    if (menu) {
+        bool menu_cam = h.pump(10, [&](const FrameView&, int) {
+            const AnalysisMsg* a = h.analysis();
+            return a && (a->flags & kAnalysisProjection) && std::fabs(a->vfov_deg - 50.0f) < 0.1f;
+        });
+        EXPECT(menu_cam, "menu camera not seen first");
+        if (h.analysis()) menu_id = h.analysis()->camera_id;
+        EXPECT(menu_id != 0, "no camera id");
+    }
+
     // 1. The projection and the view matrix are found.
     bool found = h.pump(20, [&](const FrameView&, int) {
         const AnalysisMsg* a = h.analysis();
-        return a && (a->flags & kAnalysisProjection) && (a->flags & kAnalysisView);
+        return a && (a->flags & kAnalysisProjection) && (a->flags & kAnalysisView) && std::fabs(a->vfov_deg - 60.0f) < 0.1f;
     });
+    if (menu) {
+        EXPECT(found, "stuck on the main menu camera (status: %s)", h.analysis() ? h.analysis()->status : "-");
+        EXPECT(h.analysis() && h.analysis()->camera_id != menu_id, "camera id did not change");
+    }
     EXPECT(found, "camera not found (status: %s)", h.analysis() ? h.analysis()->status : "no analysis");
     if (const AnalysisMsg* a = h.analysis()) {
         EXPECT(std::fabs(a->vfov_deg - 60.0f) < 0.01f, "vfov %f", a->vfov_deg);

@@ -12,11 +12,17 @@
 // green = 0.5 + 0.5 * cos(yaw). The camera sits at (1, 2, 3), yawed 20 deg;
 // projection: 60 deg vertical FOV, 4:3, near 0.1, far 100.
 //
-// usage: vrlayer_test_game renderpass|dynamic [camera]
+// In "menu" mode it first shows a main menu for 2 seconds: a 3D background
+// scene with its own orbiting camera (50 deg vertical FOV) in a separate
+// persistently mapped buffer. Then it "loads the level": the gameplay camera
+// above takes over and the menu block is left behind, stale, in memory.
+//
+// usage: vrlayer_test_game renderpass|dynamic [camera|menu]
 
 #include <vulkan/vulkan.h>
 
 #include <cmath>
+#include <ctime>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
@@ -62,7 +68,8 @@ static M4 mul(const M4& a, const M4& b) {
 int main(int argc, char** argv) {
     signal(SIGTERM, [](int) { g_stop = 1; });
     const bool dynamic = argc > 1 && !strcmp(argv[1], "dynamic");
-    const bool camera = argc > 2 && !strcmp(argv[2], "camera");
+    const bool menu = argc > 2 && !strcmp(argv[2], "menu");
+    const bool camera = menu || (argc > 2 && !strcmp(argv[2], "camera"));
     const uint32_t W = 160, H = 120;
 
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
@@ -253,6 +260,15 @@ int main(int argc, char** argv) {
     CHECK(vkMapMemory(device, ubo_mem, 0, VK_WHOLE_SIZE, 0, reinterpret_cast<void**>(&ubo_ptr)));
     memset(ubo_ptr, 0, kRing);
 
+    // Main menu camera block: a separate, persistently mapped allocation.
+    VkMemoryAllocateInfo menu_mai = umai;
+    menu_mai.allocationSize = 64 << 10;
+    VkDeviceMemory menu_mem;
+    CHECK(vkAllocateMemory(device, &menu_mai, nullptr, &menu_mem));
+    uint8_t* menu_ptr;
+    CHECK(vkMapMemory(device, menu_mem, 0, VK_WHOLE_SIZE, 0, reinterpret_cast<void**>(&menu_ptr)));
+    memset(menu_ptr, 0, 64 << 10);
+
     VkDescriptorSetLayoutBinding dslb{0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_FRAGMENT_BIT,
                                       nullptr};
     VkDescriptorSetLayoutCreateInfo dslci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
@@ -385,6 +401,8 @@ int main(int argc, char** argv) {
     CHECK(vkCreateFence(device, &fci, nullptr, &fence));
 
     uint64_t frames = 0;
+    timespec start_ts;
+    clock_gettime(CLOCK_MONOTONIC, &start_ts);
     while (!g_stop) {
         uint32_t idx;
         CHECK(vkAcquireNextImageKHR(device, swapchain, UINT64_MAX, acquired, VK_NULL_HANDLE, &idx));
@@ -442,7 +460,32 @@ int main(int argc, char** argv) {
         // Upload this frame's camera block to a fresh ring offset, like a
         // D3D11 Map(DISCARD) through DXVK.
         uint32_t ring_off = uint32_t((frames % (kRing / kBlock)) * kBlock);
-        if (camera) {
+        timespec now_ts;
+        clock_gettime(CLOCK_MONOTONIC, &now_ts);
+        const double elapsed = double(now_ts.tv_sec - start_ts.tv_sec) + double(now_ts.tv_nsec - start_ts.tv_nsec) * 1e-9;
+        const bool in_menu = menu && elapsed < 2.0;
+        if (in_menu) {
+            // Orbiting menu camera, 50 deg vertical FOV, rewritten in place.
+            const float ty = std::tan(25.0f * kPi / 180.0f), a = float(elapsed) * 0.5f;
+            M4 mp{};
+            mp.m[0] = 1.0f / (float(W) / float(H) * ty);
+            mp.m[5] = -1.0f / ty;
+            mp.m[10] = f_ / (n_ - f_);
+            mp.m[11] = -1.0f;
+            mp.m[14] = n_ * f_ / (n_ - f_);
+            M4 mv = identity();
+            mv.m[0] = std::cos(a);
+            mv.m[2] = std::sin(a);
+            mv.m[8] = -std::sin(a);
+            mv.m[10] = std::cos(a);
+            mv.m[14] = -10.0f;
+            uint8_t* blk = menu_ptr + 4096;
+            memcpy(blk, object.m, 64);
+            memcpy(blk + 64, mv.m, 64);
+            memcpy(blk + 128, mp.m, 64);
+            float t = float(elapsed);
+            memcpy(blk + 192, &t, 4);  // per-frame data next to the camera
+        } else if (camera) {
             uint8_t* blk = ubo_ptr + ring_off;
             memcpy(blk, object.m, 64);
             memcpy(blk + 64, view.m, 64);
@@ -518,6 +561,8 @@ int main(int argc, char** argv) {
     vkUnmapMemory(device, ubo_mem);
     vkDestroyBuffer(device, ubo, nullptr);
     vkFreeMemory(device, ubo_mem, nullptr);
+    vkUnmapMemory(device, menu_mem);
+    vkFreeMemory(device, menu_mem, nullptr);
     vkDestroyShaderModule(device, vs, nullptr);
     vkDestroyShaderModule(device, fs, nullptr);
     for (auto fb : fbs)

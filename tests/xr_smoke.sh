@@ -55,7 +55,8 @@ pids+=($!)
 sleep 2
 
 # 1. Game first: the layer must keep retrying and connect once the compositor is up.
-g1=$(game game1.log camera)
+#    The game opens with a main menu that has its own 3D camera, then loads the level.
+g1=$(game game1.log menu)
 sleep 1.5
 "$B/vrlayer-compositor" >"$T/comp.log" 2>&1 &
 pids+=($!)
@@ -63,10 +64,14 @@ expect "compositor session running" "session running" 15
 expect "late compositor picks up running game (gpu)" "frame: 160x120 via gpu, depth yes"
 expect "VR loading screen shown" "phase: loading"
 
-# 2. Loading screen: the layer finds the camera, then VR mode starts by itself.
-expect "camera lens detected" "camera: fov 75.* view found" 20
+# 2. Loading screen: the gameplay camera (not the menu's) is found.
+expect "gameplay camera detected (not the menu camera)" "camera: fov 75.* view found" 20
 expect "loading screen recommends vr" "recommended vr"
-expect "auto-start into VR mode" "phase: playing" 20
+# No /dev/uinput here, so gameplay cannot be probed: it must wait for START
+# instead of starting VR on what could be a menu camera.
+sleep 7
+expect "no auto-start without a gameplay check" "phase: loading \\(analyzing" 2
+"$CTL" continue >/dev/null && expect "START: into VR mode" "phase: playing" 10
 expect "6DOF mode active" "mode: vr"
 expect "head pose injected into the game camera" "injecting \\([0-9]+/frame\\)" 10
 "$CTL" set vr.camera alternate >/dev/null && expect "alternate-eye rendering" "camera alternate.*" 5
@@ -74,6 +79,7 @@ expect "alternate-eye injection" "injecting \\([0-9]+/frame\\)" 10
 "$CTL" set vr.camera head >/dev/null
 grep -q "game_fov = 75" "$XDG_CONFIG_HOME/vrlayer/games/4242.auto.ini" 2>/dev/null && echo "ok   detection saved to auto profile" ||
     { echo "FAIL auto profile missing"; fail=1; }
+"$CTL" rescan >/dev/null && expect "rescan finds the camera again" "camera: fov 75.* view found" 20
 
 # 3. Back to the loading screen and continue in theater.
 "$CTL" loading >/dev/null && expect "loading screen on request" "phase: loading"

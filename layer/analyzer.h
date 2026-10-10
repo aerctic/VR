@@ -22,10 +22,12 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <map>
 #include <mutex>
 #include <thread>
+#include <unordered_set>
 #include <unordered_map>
 #include <vector>
 
@@ -87,6 +89,10 @@ private:
     void finish_search_pass();
     void track();
     void scan_for_anchor(const Region& r, VkDeviceSize begin, VkDeviceSize end, std::vector<Hit>* hits) const;
+    static void scan_for_bits(const Region& r, const Bits& bits, VkDeviceSize begin, VkDeviceSize end,
+                              std::vector<Hit>* hits);
+    // Waits (scanner thread) until `n` more frames were presented.
+    void wait_presents(uint64_t n, int timeout_ms);
     Mat4 current_delta() const;  // requires state_mtx_
     void patch_at(uint8_t* base, VkDeviceSize size, VkDeviceSize hit, uint64_t key, const Mat4& d);
 
@@ -124,6 +130,14 @@ private:
     std::unordered_map<uint64_t, VkDeviceSize> cursor_;  // per hot region: last anchor seen
     uint32_t frames_without_hits_ = 0;
     uint32_t track_count_ = 0;  // scanner thread only
+    // Freshness (scanner thread only): copies that keep being (re)written
+    // belong to the live camera; menus leave stale copies behind.
+    std::unordered_set<uint64_t> last_hit_locs_;
+    std::chrono::steady_clock::time_point last_fresh_{};
+    bool reverify_ = false;  // tracked camera went stale: search again in the background
+    uint64_t presents_ = 0;  // guarded by state_mtx_
+    uint32_t camera_id_ = 0;
+    uint32_t fresh_hits_ = 0;
     uint32_t last_hits_ = 0;
     // Camera.
     bool camera_valid_ = false;

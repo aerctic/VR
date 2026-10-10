@@ -19,7 +19,7 @@ std::string fmt(const char* f, double a = 0, double b = 0, double c = 0) {
 struct Rect {
     int x, y, w, h;
 };
-const Rect kButtons[2] = {{48, 600, 560, 72}, {640, 600, 336, 72}};
+const Rect kButtons[3] = {{48, 600, 432, 72}, {504, 600, 224, 72}, {752, 600, 224, 72}};
 
 }  // namespace
 
@@ -82,30 +82,30 @@ LoadingView build_loading_view(const LoadingInputs& in, const Settings& s, doubl
     }
     v.items.push_back(c);
 
-    // 5. Mouse look.
-    LoadingView::Item m{"Mouse look", "", C::Pending};
-    if (!s.calibrate_mouse) {
-        m.state = C::Warn;
-        m.detail = "calibration disabled";
-    } else if (!in.uinput) {
-        m.state = C::Warn;
-        m.detail = "unavailable: no access to /dev/uinput";
-    } else if (in.calibration_from_profile) {
-        m.state = C::Ok;
-        m.detail = fmt("%.2f counts/deg (saved)", s.mouse_counts_per_degree);
+    // 5. Gameplay check: the camera must follow player input. A main menu's
+    //    3D background (or a cutscene) has a camera too, but it ignores you.
+    LoadingView::Item g{"Gameplay", "", C::Pending};
+    const bool mouse_ok = in.calibration == MouseCalibrator::State::Done || in.calibration_from_profile;
+    if (!in.probe_possible) {
+        g.state = C::Warn;
+        g.detail = !in.uinput ? "can't check (no /dev/uinput): press START once you are in the game"
+                              : "check disabled: press START once you are in the game";
+    } else if (in.gameplay_confirmed) {
+        g.state = C::Ok;
+        if (in.calibration == MouseCalibrator::State::Done) g.detail = "camera follows your mouse: " + in.calibration_message;
+        else if (in.calibration_from_profile) g.detail = fmt("camera follows your controls (%.2f counts/deg saved)", s.mouse_counts_per_degree);
+        else g.detail = in.calibration_message.empty() ? "camera follows your controls" : in.calibration_message;
+    } else if (!view) {
+        g.detail = "needs the camera position";
+    } else if (in.calibration == MouseCalibrator::State::Failed) {
+        g.state = C::Active;
+        g.detail = "this camera ignores your controls: main menu or cutscene? (retrying)";
     } else {
-        switch (in.calibration) {
-            case MouseCalibrator::State::Done: m.state = C::Ok; break;
-            case MouseCalibrator::State::Failed: m.state = C::Warn; break;
-            case MouseCalibrator::State::Idle: m.state = C::Pending; break;
-            default: m.state = C::Active; break;
-        }
-        m.detail = in.calibration_message.empty() ? (view ? "starting" : "needs the camera position")
+        g.state = C::Active;
+        g.detail = in.calibration_message.empty() ? "checking that the camera follows your controls"
                                                   : in.calibration_message;
     }
-    v.items.push_back(m);
-    const bool mouse_ok = m.state == C::Ok;
-    const bool mouse_settled = m.state == C::Ok || m.state == C::Warn;
+    v.items.push_back(g);
 
     // 6. Hands & controllers.
     std::string hands;
@@ -115,11 +115,10 @@ LoadingView build_loading_view(const LoadingInputs& in, const Settings& s, doubl
     hands += s.scheme == "keyboard_mouse" ? " -> keyboard + mouse" : " -> Xbox controller";
     v.items.push_back({"Hands & controls", hands, (in.controllers || in.hands_visible) ? C::Ok : C::Active});
 
-    // Recommendation.
+    // Recommendation: what START does (you vouch for being in gameplay).
     if (view) {
         v.recommended = ViewMode::Vr;
-        v.recommended_text = std::string("VR: your head moves the game camera") +
-                             (mouse_ok ? ", aim with your head" : "");
+        v.recommended_text = std::string("VR: your head moves the game camera") + (mouse_ok ? ", aim with your head" : "");
     } else if (proj && mouse_ok) {
         v.recommended = ViewMode::Immersive;
         v.recommended_text = "Immersive: game fills your view, head turns the camera";
@@ -128,18 +127,30 @@ LoadingView build_loading_view(const LoadingInputs& in, const Settings& s, doubl
         v.recommended_text = in.depth ? "Theater: 3D screen" : "Theater: big screen";
     }
 
-    // Progress and readiness.
+    // Progress and readiness. Only a camera that follows the player starts
+    // VR / immersive by itself; after the timeout an unconfirmed camera
+    // (still the main menu?) gets the theater screen, never VR.
     int done = 0;
     for (auto& it : v.items) done += (it.state == C::Ok || it.state == C::Warn) ? 1 : 0;
     v.progress = float(done) / float(v.items.size());
     const bool timed_out = in.elapsed >= double(s.loading_timeout);
-    v.ready = (view && mouse_settled) || (proj && !view && mouse_settled) || timed_out;
+    const bool confirmed = in.gameplay_confirmed && proj;
+    v.ready = confirmed || timed_out;
+    v.auto_mode = confirmed ? v.recommended : ViewMode::Theater;
+    if (!confirmed && timed_out) v.recommended_text += " - auto start: theater (gameplay not confirmed)";
+
+    const bool probing = in.calibration != MouseCalibrator::State::Idle && in.calibration != MouseCalibrator::State::Failed &&
+                         !in.gameplay_confirmed;
     if (!proj && !timed_out)
         v.hint = "Load a save / enter gameplay - the 3D camera can only be found while the game renders it.";
-    else if (proj && !mouse_settled)
-        v.hint = "Stand still in game and keep the mouse untouched while mouse look is measured.";
+    else if (proj && in.probe_possible && !in.gameplay_confirmed && probing)
+        v.hint = "Stand still in game and leave the mouse alone for a moment.";
+    else if (proj && in.probe_possible && !in.gameplay_confirmed)
+        v.hint = "In a menu? Load a save - VRLayer switches by itself. RESCAN if stuck.";
+    else if (proj && !in.probe_possible && !in.gameplay_confirmed)
+        v.hint = "Press START once you are in the game. RESCAN if it found a menu.";
     else
-        v.hint = "A / pinch: start   B: theater   Hold Start: back to this screen";
+        v.hint = "START / pinch to begin   THEATER: big screen   RESCAN: search again";
 
     if (v.ready && s.auto_continue && ready_since >= 0) v.countdown = std::fmax(0.0, kCountdown - (in.elapsed - ready_since));
     return v;
@@ -147,7 +158,7 @@ LoadingView build_loading_view(const LoadingInputs& in, const Settings& s, doubl
 
 int loading_button_at(float u, float v) {
     const float x = u * kPanelWidth, y = v * kPanelHeight;
-    for (int i = 0; i < 2; ++i) {
+    for (int i = 0; i < 3; ++i) {
         const Rect& r = kButtons[i];
         if (x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h) return i;
     }
@@ -181,10 +192,12 @@ void draw_loading_panel(Canvas& c, const LoadingView& v, int hovered, int presse
     c.text_fit(48, 536, v.recommended_text, 2, fg, kPanelWidth - 96);
     c.text_fit(48, 562, v.hint, 2, dim, kPanelWidth - 96);
 
-    for (int i = 0; i < 2; ++i) {
+    const std::string countdown =
+        v.countdown >= 0 ? " (" + std::to_string(int(std::ceil(v.countdown))) + ")" : std::string();
+    for (int i = 0; i < 3; ++i) {
         const Rect& r = kButtons[i];
-        bool primary = i == 0;
-        Rgba fill = primary ? (v.ready ? 0x2F7FD0FF : 0x2A3A52FF) : 0x223047FF;
+        const bool primary = i == kButtonStart;
+        Rgba fill = primary ? (v.ready && v.auto_mode == v.recommended ? 0x2F7FD0FF : 0x2A3A52FF) : 0x223047FF;
         if (hovered == i) fill = primary ? 0x4A9BEBFF : 0x33465FFF;
         if (pressed == i) fill = 0x6FB6FFFF;
         c.fill_rect(r.x, r.y, r.w, r.h, fill);
@@ -192,9 +205,12 @@ void draw_loading_panel(Canvas& c, const LoadingView& v, int hovered, int presse
         if (primary) {
             label = std::string("START ") +
                     (v.recommended == ViewMode::Vr ? "VR" : v.recommended == ViewMode::Immersive ? "IMMERSIVE" : "THEATER");
-            if (v.countdown >= 0) label += " (" + std::to_string(int(std::ceil(v.countdown))) + ")";
-        } else {
+            if (v.auto_mode == v.recommended) label += countdown;
+        } else if (i == kButtonTheater) {
             label = "THEATER";
+            if (v.auto_mode != v.recommended) label += countdown;
+        } else {
+            label = "RESCAN";
         }
         c.text(r.x + (r.w - Canvas::text_width(label, 3)) / 2, r.y + (r.h - 21) / 2, label, 3, fg);
     }

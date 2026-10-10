@@ -175,6 +175,10 @@ if(VRLAYER_BUILD_TESTS)
                COMMAND vrlayer_e2e_camera_test $<TARGET_FILE:vrlayer_test_game> ${CMAKE_BINARY_DIR}/devroot ${transport})
       set_tests_properties(e2e_camera_${transport} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
     endforeach()
+    # Main menu with its own 3D camera first, then the level.
+    add_test(NAME e2e_camera_menu
+             COMMAND vrlayer_e2e_camera_test $<TARGET_FILE:vrlayer_test_game> ${CMAKE_BINARY_DIR}/devroot gpu menu)
+    set_tests_properties(e2e_camera_menu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 
     foreach(transport gpu cpu)
       foreach(api renderpass dynamic)

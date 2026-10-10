@@ -24,7 +24,9 @@ struct LoadingInputs {
     AnalysisMsg analysis{};
     MouseCalibrator::State calibration = MouseCalibrator::State::Idle;
     std::string calibration_message;
-    bool calibration_from_profile = false;
+    bool calibration_from_profile = false;  // mouse counts per degree come from a profile
+    bool gameplay_confirmed = false;        // the current camera follows player input
+    bool probe_possible = false;            // we can send input to check that (uinput + enabled)
     bool uinput = false;           // virtual mouse / gamepad possible
     bool hand_tracking = false;    // runtime offers XR_EXT_hand_tracking
     bool hands_visible = false;
@@ -42,7 +44,8 @@ struct LoadingView {
     std::string subtitle;
     std::vector<Item> items;
     float progress = 0;          // overall, 0..1
-    ViewMode recommended = ViewMode::Theater;
+    ViewMode recommended = ViewMode::Theater;  // what START does (you vouch for being in gameplay)
+    ViewMode auto_mode = ViewMode::Theater;    // what the countdown starts
     std::string recommended_text;
     std::string hint;
     bool ready = false;          // enough is known to start
@@ -54,7 +57,9 @@ LoadingView build_loading_view(const LoadingInputs& in, const Settings& s, doubl
 
 const char* mode_name(ViewMode m);
 
-// Panel drawing. Buttons: 0 = start in the recommended mode, 1 = theater.
+// Panel drawing. Buttons: 0 = start in the recommended mode, 1 = theater,
+// 2 = rescan (forget the camera and search again).
+constexpr int kButtonStart = 0, kButtonTheater = 1, kButtonRescan = 2;
 constexpr int kPanelWidth = 1024, kPanelHeight = 704;
 void draw_loading_panel(Canvas& c, const LoadingView& v, int hovered_button, int pressed_button);
 // Button under panel coordinates (u, v in 0..1, v down), or -1.

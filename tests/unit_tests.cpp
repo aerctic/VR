@@ -42,7 +42,7 @@ static void test_protocol() {
     static_assert(sizeof(HelloMsg) == 16 + 16 + 32 + 8 + 128, "hello");
     static_assert(sizeof(SlotsMsg) == 16 + 48 + 16, "slots");
     static_assert(sizeof(FrameMsg) == 16 + 8 + 16 + 16 + 48, "frame");
-    static_assert(sizeof(AnalysisMsg) == 180 && sizeof(CameraMsg) == 64, "analysis / camera");
+    static_assert(sizeof(AnalysisMsg) == 188 && sizeof(CameraMsg) == 64, "analysis / camera");
     static_assert(offsetof(FrameMsg, cam_rot) == 56, "frame camera");
     static_assert(offsetof(SlotsMsg, color_alloc_size) % 8 == 0, "alignment");
     static_assert(offsetof(FrameMsg, frame_index) % 8 == 0, "alignment");
@@ -289,8 +289,11 @@ static void test_rigid_and_injection() {
 struct SimGame {
     float cpd = 12.5f;          // true counts per degree
     float accel = 1.0f;         // >1: positive moves turn more (mouse acceleration)
-    bool responds = true;
+    bool responds = true;        // camera follows the mouse
+    bool stick = false;          // camera follows the right stick
+    bool orbit = false;          // scripted menu camera turning on its own
     int lag = 3;
+    float stick_x = 0;
     std::vector<int> pending;   // counts queued for future frames
     float yaw = 15.0f;
     void push(int counts) { pending.push_back(counts); }
@@ -300,6 +303,8 @@ struct SimGame {
             pending.erase(pending.begin());
             if (responds) yaw -= float(c) / cpd * (c > 0 ? accel : 1.0f);  // mouse right = turn right
         }
+        if (stick) yaw -= stick_x * 90.0f / 60.0f;  // 90 deg/s at full deflection
+        if (orbit) yaw += 0.5f;
         float r = rad(yaw);
         const float m[9] = {std::cos(r), 0, std::sin(r), 0, 1, 0, -std::sin(r), 0, std::cos(r)};
         memcpy(rot, m, sizeof(m));
@@ -316,6 +321,7 @@ static int run_calibration(SimGame& g, MouseCalibrator& cal, int* net_counts) {
         int c = cal.update(frames / 60.0, true, rot);
         *net_counts += c;
         g.push(c);
+        g.stick_x = cal.stick_x();
     }
     return frames;
 }
@@ -336,9 +342,46 @@ static void test_calibrator() {
         MouseCalibrator cal;
         int net;
         run_calibration(g, cal, &net);
+        // A main menu: ignores the mouse and the stick -> not gameplay.
         EXPECT(cal.state() == MouseCalibrator::State::Failed);
-        EXPECT(cal.message().find("did not follow") != std::string::npos);
+        EXPECT(!cal.gameplay_confirmed());
+        EXPECT(cal.message().find("ignores the mouse and the controller") != std::string::npos);
         EXPECT(net == 0);
+        EXPECT(cal.stick_x() == 0.0f);
+    }
+    {
+        // Controller-only game: the right stick turns the camera.
+        SimGame g;
+        g.responds = false;
+        g.stick = true;
+        const float start_yaw = g.yaw;
+        MouseCalibrator cal;
+        int net;
+        run_calibration(g, cal, &net);
+        EXPECT(cal.state() == MouseCalibrator::State::DoneStick);
+        EXPECT(cal.gameplay_confirmed());
+        EXPECT(cal.stick_x() == 0.0f);
+        EXPECT_NEAR(g.yaw, start_yaw, 1.0);  // turned back
+    }
+    {
+        // Scripted orbiting menu camera: never still -> not gameplay.
+        SimGame g;
+        g.responds = false;
+        g.orbit = true;
+        MouseCalibrator cal;
+        int net;
+        run_calibration(g, cal, &net);
+        EXPECT(cal.state() == MouseCalibrator::State::Failed && !cal.gameplay_confirmed());
+        EXPECT(cal.message().find("moving on its own") != std::string::npos);
+    }
+    {
+        // Gameplay with mouse acceleration: no calibration, but it IS gameplay.
+        SimGame g;
+        g.accel = 1.6f;
+        MouseCalibrator cal;
+        int net;
+        run_calibration(g, cal, &net);
+        EXPECT(cal.gameplay_confirmed());
     }
     {
         SimGame g;
@@ -406,25 +449,57 @@ static void test_loading_logic() {
     in.has_analysis = true;
     in.analysis.flags = kAnalysisProjection | kAnalysisView | kAnalysisDepth;
     in.analysis.hfov_deg = 90;
+    in.probe_possible = true;
     in.calibration = MouseCalibrator::State::Turning;
     v = build_loading_view(in, s, -1);
-    EXPECT(v.recommended == ViewMode::Vr && !v.ready);  // still calibrating
+    EXPECT(v.recommended == ViewMode::Vr && !v.ready);  // still checking
 
+    // The main menu's 3D camera: found, but it ignores input. Never auto-starts.
+    in.calibration = MouseCalibrator::State::Failed;
+    v = build_loading_view(in, s, -1);
+    EXPECT(!v.ready && v.countdown < 0);
+    EXPECT(v.hint.find("menu") != std::string::npos);
+    // Everything on the panel fits without being cut off.
+    for (auto& it : v.items) EXPECT(Canvas::text_width(it.detail, 2) <= kPanelWidth - 172);
+    EXPECT(Canvas::text_width(v.hint, 2) <= kPanelWidth - 96);
+    EXPECT(v.recommended == ViewMode::Vr);  // what START would do if you vouch for it
+
+    // Gameplay confirmed: counts down into VR.
     in.calibration = MouseCalibrator::State::Done;
+    in.gameplay_confirmed = true;
     v = build_loading_view(in, s, 5.0);
-    EXPECT(v.ready && v.recommended == ViewMode::Vr);
+    EXPECT(v.ready && v.recommended == ViewMode::Vr && v.auto_mode == ViewMode::Vr);
     EXPECT(v.countdown > 4.9 && v.countdown <= 5.0);
     in.elapsed = 12;
     EXPECT(build_loading_view(in, s, 5.0).countdown == 0.0);
 
+    // Timeout on an unconfirmed camera: theater, never VR.
+    in.gameplay_confirmed = false;
+    in.calibration = MouseCalibrator::State::Failed;
+    in.elapsed = s.loading_timeout + 1;
+    v = build_loading_view(in, s, -1);
+    EXPECT(v.ready && v.auto_mode == ViewMode::Theater);
+
+    // No way to probe (no uinput): wait for START, theater on timeout.
+    in.probe_possible = false;
+    in.elapsed = 10;
+    EXPECT(!build_loading_view(in, s, -1).ready);
+    in.elapsed = s.loading_timeout + 1;
+    EXPECT(build_loading_view(in, s, -1).auto_mode == ViewMode::Theater);
+    in.probe_possible = true;
+    in.elapsed = 12;
+
     // Projection but no view: immersive when mouse look works, else theater.
     in.analysis.flags = kAnalysisProjection;
+    in.calibration = MouseCalibrator::State::Done;
+    in.gameplay_confirmed = true;
     EXPECT(build_loading_view(in, s, -1).recommended == ViewMode::Immersive);
-    in.calibration = MouseCalibrator::State::Failed;
+    in.calibration = MouseCalibrator::State::DoneStick;
     EXPECT(build_loading_view(in, s, -1).recommended == ViewMode::Theater);
 
     // Nothing found: ready only after the timeout.
     in.has_analysis = false;
+    in.gameplay_confirmed = false;
     in.elapsed = 10;
     EXPECT(!build_loading_view(in, s, -1).ready);
     in.elapsed = s.loading_timeout + 1;
@@ -432,7 +507,8 @@ static void test_loading_logic() {
 
     // Buttons.
     EXPECT(loading_button_at(100.0f / kPanelWidth, 630.0f / kPanelHeight) == 0);
-    EXPECT(loading_button_at(800.0f / kPanelWidth, 630.0f / kPanelHeight) == 1);
+    EXPECT(loading_button_at(600.0f / kPanelWidth, 630.0f / kPanelHeight) == kButtonTheater);
+    EXPECT(loading_button_at(850.0f / kPanelWidth, 630.0f / kPanelHeight) == kButtonRescan);
     EXPECT(loading_button_at(0.5f, 0.1f) == -1);
 }
 

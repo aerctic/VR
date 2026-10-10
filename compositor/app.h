@@ -39,7 +39,15 @@ private:
     std::string handle_command(const std::string& cmd);
     std::string status() const;
     void enter_loading(bool restart_analysis);
-    void start_playing(ViewMode choice);
+    // vouch: the user says this is gameplay (START pressed), confirm the camera.
+    void start_playing(ViewMode choice, bool vouch = false);
+    // Gameplay probe: makes sure the camera we use follows player input.
+    void update_gameplay_probe(double now);
+    void reset_probe();
+    bool camera_found() const;      // projection + view matrix known
+    bool camera_confirmed() const;  // ... and it follows the player (or the user said so)
+    bool probe_possible() const;
+    uint32_t camera_id() const;
     void update_loading(double now);
     void recenter(const XrPosef& head);
     void update_input(double now, float dt, bool head_ok, XrTime time);
@@ -93,6 +101,10 @@ private:
     double loading_start_ = 0;
     double ready_since_ = -1;
     bool calibration_started_ = false;
+    uint32_t probed_camera_id_ = 0;     // camera the probe is about
+    uint32_t confirmed_camera_id_ = 0;  // camera known to follow the player
+    double probe_retry_at_ = -1;
+    bool cpd_measured_ = false;         // mouse_counts_per_degree came from a calibration
     LoadingView loading_view_;
     bool panel_dirty_ = true;
     double panel_drawn_at_ = -1;

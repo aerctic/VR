@@ -1,5 +1,6 @@
 #include "analyzer.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -112,9 +113,15 @@ void Analyzer::thread_main() {
             pass_regions_.clear();
             pass_index_ = 0;
             proj_candidates_.clear();
+            last_hit_locs_.clear();
+            reverify_ = false;
         }
-        if (st == State::Searching) search_step();
-        else track();
+        if (st == State::Searching) {
+            search_step();
+        } else {
+            track();
+            if (reverify_) search_step();  // keeps tracking the current camera meanwhile
+        }
     }
 }
 
@@ -124,10 +131,13 @@ void Analyzer::search_step() {
         std::lock_guard<std::mutex> l(state_mtx_);
         aspect = float(extent_.width) / float(extent_.height);
     }
-    if (pass_index_ >= pass_regions_.size()) {
+    if (pass_regions_.empty()) {
         // Start a new pass over everything that is mapped right now.
-        if (!pass_regions_.empty()) finish_search_pass();
-        pass_regions_.clear();
+        {
+            std::lock_guard<std::mutex> l(state_mtx_);
+            inline_candidates_.clear();  // only count what this pass sees live
+        }
+        proj_candidates_.clear();
         pass_index_ = 0;
         pass_offset_ = 0;
         pass_bytes_ = 0;
@@ -181,41 +191,128 @@ void Analyzer::search_step() {
         auto& v = proj_candidates_[b];
         if (v.size() < 512) v.push_back(h);
     }
-    std::lock_guard<std::mutex> l(state_mtx_);
-    scanned_total_ += done;
-    progress_ = pass_total_ ? uint32_t(std::min<uint64_t>(99, pass_bytes_ * 100 / pass_total_)) : 0;
-    report_dirty_ = true;
+    {
+        std::lock_guard<std::mutex> l(state_mtx_);
+        scanned_total_ += done;
+        progress_ = pass_total_ ? uint32_t(std::min<uint64_t>(99, pass_bytes_ * 100 / pass_total_)) : 0;
+        report_dirty_ = true;
+    }
+    if (pass_index_ >= pass_regions_.size()) {
+        finish_search_pass();
+        pass_regions_.clear();
+    }
+}
+
+static uint64_t neighbourhood_hash(const uint8_t* base, VkDeviceSize size, VkDeviceSize off) {
+    // FNV-1a over the constant block around a projection copy: live camera
+    // blocks also carry per-frame data (time, other matrices) that changes.
+    VkDeviceSize b = off > 512 ? off - 512 : 0, e = std::min(size, off + 576);
+    uint64_t h = 1469598103934665603ull;
+    for (VkDeviceSize i = b; i < e; ++i) h = (h ^ base[i]) * 1099511628211ull;
+    return h;
+}
+
+void Analyzer::wait_presents(uint64_t n, int timeout_ms) {
+    std::unique_lock<std::mutex> l(state_mtx_);
+    const uint64_t target = presents_ + n;
+    cv_.wait_for(l, std::chrono::milliseconds(timeout_ms), [&] { return stop_ || presents_ >= target; });
 }
 
 void Analyzer::finish_search_pass() {
-    // Pick the projection seen most often (memory copies + inline uses).
-    const Bits* best = nullptr;
-    size_t best_count = 0;
-    bool best_inline = false;
-    for (auto& [b, hits] : proj_candidates_)
-        if (hits.size() > best_count) {
-            best = &b;
-            best_count = hits.size();
-        }
+    // Candidates: every projection seen in this pass, in memory or inline.
+    struct Cand {
+        Bits bits;
+        size_t count;
+        bool inl;
+        size_t fresh = 0;
+    };
+    std::vector<Cand> cands;
+    for (auto& [b, hits] : proj_candidates_) cands.push_back({b, hits.size(), false});
     std::map<Bits, int> inline_copy;
     {
         std::lock_guard<std::mutex> l(state_mtx_);
         inline_copy = inline_candidates_;
     }
-    for (auto& [b, n] : inline_copy)
-        if (size_t(n) > best_count) {
-            best = &b;
-            best_count = size_t(n);
-            best_inline = true;
-        }
-    if (!best) {
+    for (auto& [b, n] : inline_copy) cands.push_back({b, size_t(n), true});
+    if (cands.empty()) {
         std::lock_guard<std::mutex> l(state_mtx_);
-        snprintf(status_, sizeof(status_), "searching %llu MB: no 3D camera yet (get into gameplay)",
-                 static_cast<unsigned long long>(pass_total_ >> 20));
+        if (state_ == State::Searching)
+            snprintf(status_, sizeof(status_), "searching %llu MB: no 3D camera yet (get into gameplay)",
+                     static_cast<unsigned long long>(pass_total_ >> 20));
+        reverify_ = false;
+        last_fresh_ = std::chrono::steady_clock::now();
         report_dirty_ = true;
-        proj_candidates_.clear();
         return;
     }
+    std::stable_sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.count > b.count; });
+    if (cands.size() > 4) cands.resize(4);
+
+    // Freshness: a menu leaves its camera blocks behind in memory, the live
+    // camera keeps writing new copies (ring buffers) or new contents around
+    // them. Snapshot, let a few frames render, and compare.
+    struct Snap {
+        std::set<uint64_t> locs;
+        std::map<uint64_t, uint64_t> hashes;
+        std::set<uint64_t> regions;
+    };
+    std::vector<Snap> snaps(cands.size());
+    {
+        std::lock_guard<std::mutex> l(regions_mtx_);
+        std::unordered_map<uint64_t, const Region*> by_id;
+        for (auto& [mem, r] : regions_) by_id[r.id] = &r;
+        for (size_t i = 0; i < cands.size(); ++i) {
+            if (cands[i].inl) continue;
+            for (const Hit& h : proj_candidates_[cands[i].bits]) {
+                auto it = by_id.find(h.region);
+                if (it == by_id.end() || !it->second->ptr) continue;
+                uint64_t key = loc_key(h.region, h.offset);
+                snaps[i].locs.insert(key);
+                snaps[i].regions.insert(h.region);
+                if (snaps[i].hashes.size() < 64)
+                    snaps[i].hashes[key] = neighbourhood_hash(it->second->ptr, it->second->size, h.offset);
+            }
+        }
+    }
+    wait_presents(3, 400);
+    std::map<Bits, std::vector<Hit>> rescanned;
+    {
+        std::lock_guard<std::mutex> l(regions_mtx_);
+        std::unordered_map<uint64_t, const Region*> by_id;
+        for (auto& [mem, r] : regions_) by_id[r.id] = &r;
+        for (size_t i = 0; i < cands.size(); ++i) {
+            if (cands[i].inl) {
+                cands[i].fresh = cands[i].count;  // seen in command buffers during this pass: live
+                continue;
+            }
+            std::vector<Hit>& now = rescanned[cands[i].bits];
+            for (uint64_t id : snaps[i].regions) {
+                auto it = by_id.find(id);
+                if (it == by_id.end() || !it->second->ptr) continue;
+                scan_for_bits(*it->second, cands[i].bits, 0, it->second->size, &now);
+            }
+            for (const Hit& h : now) {
+                uint64_t key = loc_key(h.region, h.offset);
+                auto hs = snaps[i].hashes.find(key);
+                if (!snaps[i].locs.count(key)) {
+                    cands[i].fresh++;  // a new copy was written
+                } else if (hs != snaps[i].hashes.end()) {
+                    const Region* r = by_id[h.region];
+                    if (neighbourhood_hash(r->ptr, r->size, h.offset) != hs->second) cands[i].fresh++;
+                }
+            }
+        }
+    }
+    size_t pick = 0;
+    for (size_t i = 1; i < cands.size(); ++i)
+        if (cands[i].fresh > cands[pick].fresh) pick = i;
+    if (cands.size() > 1)
+        VRL_DBG("layer", "camera candidates: %zu, picked #%zu (%zu copies, %zu fresh)", cands.size(), pick,
+                cands[pick].count, cands[pick].fresh);
+    const Bits* best = &cands[pick].bits;
+    const size_t best_count = cands[pick].count;
+    const bool best_inline = cands[pick].inl;
+    const size_t best_fresh = cands[pick].fresh;
+    if (!best_inline && !rescanned[*best].empty()) proj_candidates_[*best] = rescanned[*best];
 
     Bits pbits = *best;
     ProjectionInfo pi;
@@ -282,7 +379,32 @@ void Analyzer::finish_search_pass() {
     int vpn = best_of(vp_for_view, &vp_key);
     int invn = best_of(inv_for_view, &inv_key);
 
+    // Stable identity of this camera, so the compositor notices switches
+    // (main menu -> level).
+    uint32_t id = 2166136261u;
+    for (uint32_t w : pbits) id = (id ^ w) * 16777619u;
+    id ^= uint32_t(vrel * 2654435761ll) ^ (best_inline ? 0x80000000u : 0u);
+    if (id == 0) id = 1;
+
     std::lock_guard<std::mutex> l(state_mtx_);
+    reverify_ = false;
+    last_fresh_ = std::chrono::steady_clock::now();
+    if (state_ == State::Tracking && id == camera_id_) {
+        // Re-verification found the same camera: keep everything as it is.
+        if (!best_inline) {
+            hot_regions_.assign(regions_hit.begin(), regions_hit.end());
+            for (auto& [r, c] : cursors) cursor_[r] = c;
+        }
+        return;
+    }
+    if (have_proj_ && camera_id_ != id) {
+        VRL_LOG("layer", "camera changed (%zu fresh copies): %s", best_fresh,
+                best_fresh ? "the live camera replaces the old one" : "the old camera disappeared");
+        patched_.clear();
+        last_view_seen_.clear();
+        camera_valid_ = false;
+    }
+    camera_id_ = id;
     have_proj_ = true;
     proj_bits_ = pbits;
     proj_ = pi;
@@ -313,14 +435,19 @@ void Analyzer::finish_search_pass() {
 }
 
 void Analyzer::scan_for_anchor(const Region& r, VkDeviceSize begin, VkDeviceSize end, std::vector<Hit>* hits) const {
+    scan_for_bits(r, proj_bits_, begin, end, hits);
+}
+
+void Analyzer::scan_for_bits(const Region& r, const Bits& bits, VkDeviceSize begin, VkDeviceSize end,
+                             std::vector<Hit>* hits) {
     uint64_t first;
-    memcpy(&first, proj_bits_.data(), 8);
+    memcpy(&first, bits.data(), 8);
     end = std::min(end, r.size);
     begin -= begin % kStride;
     for (VkDeviceSize off = begin; off + 64 <= end; off += kStride) {
         uint64_t v;
         memcpy(&v, r.ptr + off, 8);
-        if (v != first || memcmp(r.ptr + off, proj_bits_.data(), 64) != 0) continue;
+        if (v != first || memcmp(r.ptr + off, bits.data(), 64) != 0) continue;
         hits->push_back(Hit{r.id, off});
     }
 }
@@ -342,6 +469,7 @@ void Analyzer::track() {
 
     std::vector<Hit> hits;
     bool found_camera = false;
+    size_t fresh = 0;
     ++track_count_;
     float rot[9], pos[3];
     {
@@ -388,6 +516,7 @@ void Analyzer::track() {
                 memcpy(orig.data(), m, 64);
                 auto& seen = last_view_seen_[key];
                 bool changed = seen != orig;
+                if (changed) ++fresh;
                 seen = orig;
                 if (!pick || changed) {
                     chosen = v;
@@ -406,8 +535,24 @@ void Analyzer::track() {
         }
     }
 
+    // New copies also count as fresh (ring buffers).
+    std::unordered_set<uint64_t> locs;
+    for (const Hit& h : hits) {
+        uint64_t key = loc_key(h.region, h.offset);
+        locs.insert(key);
+        if (!last_hit_locs_.count(key)) ++fresh;
+    }
+    last_hit_locs_ = std::move(locs);
+    const auto now = std::chrono::steady_clock::now();
+    if (fresh) last_fresh_ = now;
+    else if (!reverify_ && now - last_fresh_ > std::chrono::seconds(3)) {
+        VRL_DBG("layer", "tracked camera is stale, looking for a live one");
+        reverify_ = true;  // keep tracking while a background pass looks for a live camera
+    }
+
     std::lock_guard<std::mutex> l(state_mtx_);
     if (state_ != State::Tracking) return;
+    fresh_hits_ = uint32_t(fresh);
     cursor_ = cursors;
     last_hits_ = uint32_t(hits.size());
     if (hits.empty()) {
@@ -587,12 +732,13 @@ bool Analyzer::on_present(VkExtent2D extent, bool depth_selected) {
     patched_last_frame_ = patched_this_frame_;
     patched_this_frame_ = 0;
     // frame_seq_/frame_eye_ describe the frame being presented now.
+    ++presents_;
     presented_seq_ = frame_seq_;
     presented_eye_ = frame_eye_;
     frame_seq_ = frame_eye_ = 0;
     eye_ = CameraMode(camera_msg_.mode) == CameraMode::Alternate ? (eye_ == 1 ? 2 : 1) : 0;
     kick_ = true;
-    cv_.notify_one();
+    cv_.notify_all();
     bool dirty = report_dirty_;
     return dirty;
 }
@@ -655,6 +801,8 @@ AnalysisMsg Analyzer::report() {
     m.proj_hits = last_hits_;
     m.patched = patched_last_frame_;
     m.progress = state_ == State::Tracking ? 100u : progress_;
+    m.camera_id = have_proj_ ? camera_id_ : 0;
+    m.fresh = fresh_hits_;
     snprintf(m.status, sizeof(m.status), "%s", status_);
     report_dirty_ = false;
     return m;

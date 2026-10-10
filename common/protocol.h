@@ -13,7 +13,7 @@
 namespace vrl {
 
 constexpr uint32_t kMagic = 0x594C5256;  // "VRLY"
-constexpr uint32_t kProtocolVersion = 2;
+constexpr uint32_t kProtocolVersion = 3;
 constexpr uint32_t kMaxSlots = 3;
 constexpr const char* kDefaultSocketName = "vrlayer";
 
@@ -147,6 +147,8 @@ struct AnalysisMsg {
     uint32_t proj_hits;   // copies of the projection seen in the last scan
     uint32_t patched;     // view matrices rewritten for the last frame
     uint32_t progress;    // 0..100 of the current search pass
+    uint32_t camera_id;   // identity of the tracked camera (0 = none); changes on menu -> level switches
+    uint32_t fresh;       // copies of the camera written since the previous scan (0 = stale)
     char status[96];
 };
 

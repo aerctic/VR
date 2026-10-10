@@ -161,12 +161,14 @@ int main() {
     in.analysis.near_d = 0.1f;
     in.analysis.reversed = 1;
     in.uinput = true;
-    in.calibration = MouseCalibrator::State::Returning;
-    in.calibration_message = "hold still: measuring mouse look";
+    // The camera found so far ignores input: probably the main menu's.
+    in.probe_possible = true;
+    in.calibration = MouseCalibrator::State::Failed;
+    in.calibration_message = "camera ignores the mouse and the controller (main menu?)";
     in.controllers = true;
     in.elapsed = 14;
     Canvas c(kPanelWidth, kPanelHeight);
-    draw_loading_panel(c, build_loading_view(in, s, -1), 0, -1);
+    draw_loading_panel(c, build_loading_view(in, s, -1), kButtonRescan, -1);
     EXPECT(c.data()[(size_t(630) * kPanelWidth + 300) * 4 + 2] > 150, "start button not drawn");
 
     if (dump) {
