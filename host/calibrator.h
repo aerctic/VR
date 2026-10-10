@@ -51,6 +51,9 @@ public:
     bool gameplay_confirmed() const {
         return state_ == State::Done || state_ == State::DoneStick || responded_;
     }
+    // The probe failed on a camera that stayed perfectly still and ignored the
+    // mouse and the stick: a fixed-camera game (or a static menu).
+    bool camera_static() const { return state_ == State::Failed && static_seen_ && !responded_; }
     float counts_per_degree() const { return cpd_; }
     const std::string& message() const { return message_; }
 
@@ -68,6 +71,7 @@ private:
     float stick_x_ = 0;
     double stick_held_ = 0;
     bool responded_ = false;
+    bool static_seen_ = false;
     float cpd_ = 0;
     std::string message_;
 };

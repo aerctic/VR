@@ -98,6 +98,10 @@ static void test_settings() {
     EXPECT(!s.set("nope.nothing", "1", &err) && err.find("unknown") != std::string::npos);
     EXPECT(!s.set("stereo.depth_reversed", "maybe", &err));
     EXPECT(!s.set("stereo.separation", "abc", &err));
+    EXPECT(s.set("input.hand_mouse", "absolute", &err) && !s.set("input.hand_mouse", "sideways", &err));
+    EXPECT(s.set("vr.fixed_camera", "true", &err) && s.fixed_camera);
+    s.fixed_camera = false;
+    s.hand_mouse = "off";
     EXPECT(s.set("stereo.separation", "0.04", &err) && s.get("stereo.separation") == "0.04");
 
     // dump() must round-trip through the INI parser.
@@ -346,6 +350,7 @@ static void test_calibrator() {
         EXPECT(cal.state() == MouseCalibrator::State::Failed);
         EXPECT(!cal.gameplay_confirmed());
         EXPECT(cal.message().find("ignores the mouse and the controller") != std::string::npos);
+        EXPECT(cal.camera_static());  // still and ignoring input: maybe a fixed-camera game
         EXPECT(net == 0);
         EXPECT(cal.stick_x() == 0.0f);
     }
@@ -373,6 +378,7 @@ static void test_calibrator() {
         run_calibration(g, cal, &net);
         EXPECT(cal.state() == MouseCalibrator::State::Failed && !cal.gameplay_confirmed());
         EXPECT(cal.message().find("moving on its own") != std::string::npos);
+        EXPECT(!cal.camera_static());
     }
     {
         // Gameplay with mouse acceleration: no calibration, but it IS gameplay.
@@ -464,6 +470,19 @@ static void test_loading_logic() {
     EXPECT(Canvas::text_width(v.hint, 2) <= kPanelWidth - 96);
     EXPECT(v.recommended == ViewMode::Vr);  // what START would do if you vouch for it
 
+    // Still camera ignoring input: offered as a fixed-camera game, START = VR.
+    in.camera_static = true;
+    v = build_loading_view(in, s, -1);
+    EXPECT(!v.ready && v.recommended == ViewMode::Vr && v.hint.find("Fixed camera") != std::string::npos);
+    for (auto& it : v.items) EXPECT(Canvas::text_width(it.detail, 2) <= kPanelWidth - 172);
+    EXPECT(Canvas::text_width(v.hint, 2) <= kPanelWidth - 96);
+    // Saved as a fixed-camera game: straight into VR.
+    in.fixed_camera = true;
+    v = build_loading_view(in, s, 5.0);
+    EXPECT(v.ready && v.auto_mode == ViewMode::Vr);
+    in.fixed_camera = false;
+    in.camera_static = false;
+
     // Gameplay confirmed: counts down into VR.
     in.calibration = MouseCalibrator::State::Done;
     in.gameplay_confirmed = true;
@@ -524,6 +543,54 @@ static void test_canvas() {
     EXPECT(px(1, 1) == 255 && px(1, 7) == 255 && px(2, 1) == 0 && px(2, 4) == 255);
     c.fill_rect(0, 0, 4, 4, 0xFF000080);  // 50% red over black
     EXPECT(std::abs(int(c.data()[0]) - 128) <= 1 && c.data()[1] == 0);
+}
+
+
+static void test_hand_mouse_math() {
+    // Camera pitch, Y-up engine (Unity-like), camera looking 40 deg down.
+    {
+        Quat q = from_yaw_pitch(rad(25), rad(-40));
+        float rot[9];
+        const Vec3 cols[3] = {rotate(q, {1, 0, 0}), rotate(q, {0, 1, 0}), rotate(q, {0, 0, 1})};
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c) rot[r * 3 + c] = c == 0 ? (&cols[0].x)[r] : c == 1 ? (&cols[1].x)[r] : (&cols[2].x)[r];
+        EXPECT_NEAR(deg(camera_pitch(rot, 1, -1)), -40, 1e-3);
+    }
+    // Z-up engine (Unreal-like), left-handed camera looking +Z, pitched 30 deg down.
+    {
+        const float p = rad(-30);
+        const float fwd[3] = {std::cos(p), 0, std::sin(p)}, up[3] = {-std::sin(p), 0, std::cos(p)}, right[3] = {0, 1, 0};
+        float rot[9];
+        for (int r = 0; r < 3; ++r) {
+            rot[r * 3 + 0] = right[r];
+            rot[r * 3 + 1] = up[r];
+            rot[r * 3 + 2] = fwd[r];
+        }
+        EXPECT_NEAR(deg(camera_pitch(rot, 1, 1)), -30, 1e-3);
+    }
+    // Projection onto the game screen.
+    float u, v;
+    const Quat cam = from_yaw_pitch(0, rad(-30));
+    const Vec3 pos{0, 1.2f, 0};
+    EXPECT(project_to_screen(add(pos, rotate(cam, {0, 0, -1})), pos, cam, rad(90), rad(60), &u, &v));
+    EXPECT_NEAR(u, 0.5, 1e-5);
+    EXPECT_NEAR(v, 0.5, 1e-5);
+    // At the right edge of a 90 deg FOV and the top edge of a 60 deg one.
+    EXPECT(project_to_screen(add(pos, rotate(cam, {1, 0, -1})), pos, cam, rad(90), rad(60), &u, &v));
+    EXPECT_NEAR(u, 1.0, 1e-4);
+    EXPECT(project_to_screen(add(pos, rotate(cam, {0, std::tan(rad(30)), -1})), pos, cam, rad(90), rad(60), &u, &v));
+    EXPECT_NEAR(v, 0.0, 1e-4);
+    EXPECT(!project_to_screen(add(pos, rotate(cam, {0, 0, 1})), pos, cam, rad(90), rad(60), &u, &v));  // behind
+
+    // Relative cursor walks to the target and keeps sub-count remainders.
+    RelativeCursor rc;
+    int dx, dy;
+    rc.step(500, 300, 2.0f, &dx, &dy);  // first call: assumed already there
+    EXPECT(dx == 0 && dy == 0);
+    rc.step(510.25f, 295, 2.0f, &dx, &dy);
+    EXPECT(dx == 20 && dy == -10);
+    rc.step(510.5f, 295, 2.0f, &dx, &dy);
+    EXPECT(dx == 1 && dy == 0);
 }
 
 static void test_head_mouse() {
@@ -642,6 +709,7 @@ int main() {
     test_controls();
     test_loading_logic();
     test_canvas();
+    test_hand_mouse_math();
     fprintf(stderr, "%s: %d checks, %d failures\n", g_failures ? "FAILED" : "PASSED", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

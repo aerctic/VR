@@ -105,6 +105,21 @@ On every frame the compositor sends your head pose to the layer. Just before the
 - Turning: the game's own stick turning, or snap turns with the right stick in the `keyboard_mouse` scheme, rotate the world around you like in native VR games.
 - `vr.units_per_metre`: the game's world scale (Unreal Engine uses 100), so leaning moves the right distance.
 
+### Games you play with a mouse-controlled hand (fixed camera)
+
+Some games don't move the camera at all. You sit at a desk or table, and the mouse moves a hand or a tool. Two features make those games playable with your real hands, standing in the game's room:
+
+- **Fixed camera.** The gameplay check turns such a camera with the mouse and the stick, and it never moves. The loading room then shows "still camera that ignores mouse and stick: table game?". Press **START** and you are in VR mode: your head pose drives the game camera, so you look around and lean in the game's room. This is saved as `vr.fixed_camera = true` in the game's auto profile, so the next launch goes straight into VR. VRLayer measures the pitch of the game camera, so a camera looking down at a table still gives you a level horizon. Look around once and hold Start for 1 s while looking the way the game camera looks, to recenter.
+- **Hand mouse** (`input.hand_mouse = absolute` or `relative`). The tip of your controller (`input.hand_mouse_offset` metres in front of it), or your index fingertip with hand tracking, is projected through the game camera. The mouse cursor goes to that spot, so the in-game hand follows your real hand. Trigger or pinch is a left click, grip or middle pinch a right click. Use `absolute` for games that show or read the cursor position, and `relative` for games that lock the cursor and read mouse motion. A small orange dot marks the tip.
+
+```sh
+vrlayer-ctl set input.hand_mouse absolute   # try relative if the hand doesn't follow
+vrlayer-ctl set input.hand_mouse_offset 0.2 # tool tip further from the controller
+vrlayer-ctl save
+```
+
+The cursor moves in 2D, so the in-game hand goes where your hand appears through the game camera, at whatever depth the game puts it. Moving your hand closer to or further from the camera does not change the game's depth. In VR mode the area outside the game's own field of view stays black (`vr.show_room` shows the VR room there instead). Set the game's FOV as high as it allows to see more of the room around you.
+
 ### Controllers
 
 | VR controller                          | Gamepad                           |
@@ -215,7 +230,8 @@ cmake --build build && (cd build && ctest --output-on-failure)
 - The depth heuristic can pick the wrong buffer in some engines. `stereo.show_depth` shows what was picked, and `VRLAYER_DEPTH_MIN_DRAWS` can help. MSAA depth buffers aren't captured; turn MSAA off in-game, or use the game in 2D theater mode.
 - **VR mode is generic and therefore experimental.** It works when the game keeps its camera in a constant buffer as a separate view matrix next to the projection. Engines that only upload a combined view-projection, keep several camera copies (previous frame, shadows, reflections), or cull on the CPU with the original camera will show artifacts: objects popping at the screen edges, wrong shadows, or reflections that don't follow. In those games the loading room recommends a different mode, or use `vrlayer-ctl mode theater`. The game's physics, HUD and aim aren't changed beyond what the mouse can do: there are no motion-controlled hands *inside* the game.
 - Camera search reads the game's mapped memory from a background thread. On games with huge write-combined heaps the first search can take several seconds, and injection costs a little CPU at every submit.
-- Mouse calibration needs a game that turns its camera with the mouse, without acceleration or smoothing. The gameplay check briefly turns the camera when the loading room or a camera switch asks for it. Games whose camera doesn't respond to the mouse or the right stick (for example fixed-camera games) are never confirmed: press START to use them anyway.
+- Mouse calibration needs a game that turns its camera with the mouse, without acceleration or smoothing. The gameplay check briefly turns the camera when the loading room or a camera switch asks for it. Fixed-camera games are confirmed when you press START (and remembered).
+- Hand mouse only controls the game's 2D cursor. How the game turns that into the motion of its hand, tool or physics is up to the game. VRLayer doesn't know the game's mechanics, and has not been tested with specific commercial titles.
 - The detected near/far assume Vulkan's [0, 1] clip depth (DXVK, VKD3D-Proton and native Vulkan). OpenGL games through Zink may get the wrong exact depth: set `stereo.depth_reversed` to fall back to the heuristic.
 - Immersive mode turns the camera only (yaw/pitch). Games with mouse acceleration or smoothing will drift.
 - HDR swapchains are shown without tone mapping.

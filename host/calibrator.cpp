@@ -34,6 +34,7 @@ void MouseCalibrator::start(double now, int counts) {
     cpd_ = 0;
     stick_x_ = 0;
     responded_ = false;
+    static_seen_ = false;
     message_ = "hold still: checking that the camera follows your controls";
 }
 
@@ -78,6 +79,7 @@ int MouseCalibrator::update(double now, bool valid, const float rot[9]) {
             }
             if (now - phase_start_ > kPhaseTimeout * 3) {
                 state_ = State::Failed;
+                static_seen_ = false;
                 message_ = "camera keeps moving on its own (main menu or cutscene?)";
             }
             return 0;
@@ -128,6 +130,7 @@ int MouseCalibrator::update(double now, bool valid, const float rot[9]) {
                 message_ = "camera follows the controller (no mouse look)";
             } else {
                 phase_start_ = now;
+                static_seen_ = true;
                 fail("camera ignores the mouse and the controller (main menu?)");
             }
             return 0;

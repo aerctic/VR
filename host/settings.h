@@ -49,6 +49,11 @@ struct Settings {
     std::string aim = "auto";        // auto | head (mouse follows head) | body (head only moves the view)
     float snap_turn = 30.0f;         // degrees per right-stick flick (keyboard_mouse scheme), 0 = smooth
     float turn_speed = 120.0f;       // degrees per second for smooth turning
+    // The game's camera does not follow the mouse or stick (table / puzzle
+    // games): trust it without the gameplay check. Saved by the loading room
+    // when you press START on such a camera.
+    bool fixed_camera = false;
+    bool show_room = false;          // VR room around the game's view in VR mode (else black)
 
     // [loading]
     bool loading = true;              // VR loading screen with game analysis
@@ -65,6 +70,12 @@ struct Settings {
     std::string scheme = "gamepad";  // gamepad | keyboard_mouse
     bool pointer = true;             // point at the screen to move the mouse, trigger clicks
     bool hand_tracking = true;       // pinch gestures and hand pointer when hands are tracked
+    // VR mode: the mouse cursor follows your hand, projected through the game
+    // camera, so a mouse-controlled in-game hand / tool is where your hand is.
+    std::string hand_mouse = "off";        // off | absolute (cursor position) | relative (mouse motion)
+    std::string hand_mouse_hand = "right";  // right | left
+    float hand_mouse_offset = 0.12f;       // metres from the controller to the tool tip
+    float hand_mouse_counts_per_pixel = 1.0f;  // relative mode: mouse counts per screen pixel
 
     // [bindings] for the keyboard_mouse scheme: button -> key name.
     std::map<std::string, std::string> bindings;

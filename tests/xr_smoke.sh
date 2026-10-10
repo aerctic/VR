@@ -77,6 +77,11 @@ expect "head pose injected into the game camera" "injecting \\([0-9]+/frame\\)" 
 "$CTL" set vr.camera alternate >/dev/null && expect "alternate-eye rendering" "camera alternate.*" 5
 expect "alternate-eye injection" "injecting \\([0-9]+/frame\\)" 10
 "$CTL" set vr.camera head >/dev/null
+"$CTL" set input.hand_mouse absolute >/dev/null && expect "hand mouse in VR mode" "hand mouse: absolute"
+expect "VR keeps injecting with hand mouse" "injecting \\([0-9]+/frame\\)" 10
+"$CTL" set input.hand_mouse off >/dev/null
+"$CTL" set vr.fixed_camera true >/dev/null && expect "fixed camera trusted" "fixed camera: yes"
+"$CTL" set vr.fixed_camera false >/dev/null
 grep -q "game_fov = 75" "$XDG_CONFIG_HOME/vrlayer/games/4242.auto.ini" 2>/dev/null && echo "ok   detection saved to auto profile" ||
     { echo "FAIL auto profile missing"; fail=1; }
 "$CTL" rescan >/dev/null && expect "rescan finds the camera again" "camera: fov 75.* view found" 20

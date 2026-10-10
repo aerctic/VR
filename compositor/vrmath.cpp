@@ -47,4 +47,37 @@ void yaw_pitch(Quat q, float* yaw, float* pitch) {
     *pitch = std::asin(y);
 }
 
+bool project_to_screen(Vec3 point, Vec3 cam_pos, Quat cam_rot, float hfov, float vfov, float* u, float* v) {
+    Vec3 p = rotate(conjugate(cam_rot), sub(point, cam_pos));
+    float d = -p.z;  // distance along the view direction
+    if (d < 0.02f) return false;
+    *u = 0.5f + 0.5f * (p.x / d) / std::tan(hfov * 0.5f);
+    *v = 0.5f - 0.5f * (p.y / d) / std::tan(vfov * 0.5f);
+    return true;
+}
+
+float camera_pitch(const float r[9], float up_sign, float fwd_sign) {
+    // Columns of R are the camera axes in world space.
+    const float fwd[3] = {r[2] * fwd_sign, r[5] * fwd_sign, r[8] * fwd_sign};
+    const float up[3] = {r[1] * up_sign, r[4] * up_sign, r[7] * up_sign};
+    int axis = 0;
+    for (int i = 1; i < 3; ++i)
+        if (std::fabs(up[i]) > std::fabs(up[axis])) axis = i;
+    float s = fwd[axis] * (up[axis] < 0 ? -1.0f : 1.0f);
+    s = s > 1 ? 1 : (s < -1 ? -1 : s);
+    return std::asin(s);
+}
+
+void RelativeCursor::step(float tx, float ty, float cpp, int* dx, int* dy) {
+    if (x < 0) {  // first use: assume the cursor is already there
+        x = tx;
+        y = ty;
+    }
+    float fx = (tx - x) * cpp, fy = (ty - y) * cpp;
+    *dx = int(std::trunc(fx));
+    *dy = int(std::trunc(fy));
+    x += float(*dx) / cpp;
+    y += float(*dy) / cpp;
+}
+
 }  // namespace vrl

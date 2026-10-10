@@ -130,8 +130,10 @@ void App::collect_prims() {
         capsule(p, back, 0.018f, ScenePrim::Capsule, 0.16f, 0.18f, 0.22f, 1.0f);
         sphere(p, 0.012f, 0.35f, 0.7f, 1.0f, 1.0f);
     }
-    // Pointer.
-    if (pointer_active_) {
+    // Tool tip driving the game's mouse (input.hand_mouse).
+    if (hand_cursor_valid_) sphere(hand_cursor_, 0.01f, 1.0f, 0.75f, 0.3f, 0.9f);
+    // Pointer (not in VR mode: there is no screen to point at).
+    if (pointer_active_ && !(phase_ == Phase::Playing && effective_mode() == ViewMode::Vr)) {
         capsule(pointer_from_, pointer_to_, pointer_hit_ ? 0.003f : 0.0015f, ScenePrim::Glow, 0.3f, 0.7f, 1.0f,
                 pointer_hit_ ? 0.9f : 0.35f);
         if (pointer_hit_) sphere(pointer_to_, pointer_down_ ? 0.016f : 0.012f, 0.6f, 0.85f, 1.0f, 1.0f);
@@ -279,7 +281,9 @@ void App::render(double now) {
     }
     const uint32_t sw = scene_.eye_width(), sh = scene_.eye_height();
     env_this_frame_ = false;
-    if (views_ok_ && (phase_ == Phase::Loading || settings_.environment)) {
+    // In VR mode you are in the game's room: outside its view stays black
+    // unless vr.show_room asks for the VR room.
+    if (views_ok_ && (phase_ == Phase::Loading || settings_.environment) && (!vr || settings_.show_room)) {
         scene_.record(cmd_, eyes, floor_y_, float(now), false, {});
         if (VkImage dst = acquire(env_sc_, 2 * sw, sh)) {
             blit(cmd_, scene_.output(false), 0, 0, 2 * sw, sh, dst, 0, 0, 2 * sw, sh);

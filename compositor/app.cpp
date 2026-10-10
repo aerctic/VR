@@ -66,7 +66,7 @@ void App::load_profile(uint32_t appid) {
 // user's own games/<appid>.ini (so hand-tuned values always win).
 void App::write_auto_profile() {
     const AnalysisMsg* a = analysis();
-    if (!appid_ || (!a && calibrator_.state() != MouseCalibrator::State::Done)) return;
+    if (!appid_ || (!a && calibrator_.state() != MouseCalibrator::State::Done && !fixed_camera_detected_)) return;
     std::string dir = config_dir() + "/games";
     mkdir(config_dir().c_str(), 0755);
     mkdir(dir.c_str(), 0755);
@@ -84,6 +84,8 @@ void App::write_auto_profile() {
     }
     if (calibrator_.state() == MouseCalibrator::State::Done)
         f << "\n[input]\nmouse_counts_per_degree = " << calibrator_.counts_per_degree() << "\n";
+    if (fixed_camera_detected_)
+        f << "\n[vr]\n; the camera does not follow mouse or stick: no gameplay check needed\nfixed_camera = true\n";
     VRL_LOG("compositor", "detection results saved to %s", path.c_str());
 }
 
@@ -105,7 +107,7 @@ uint32_t App::camera_id() const {
 bool App::probe_possible() const { return uinput_ok_ && settings_.calibrate_mouse; }
 
 bool App::camera_confirmed() const {
-    return camera_found() && (confirmed_camera_id_ == camera_id() || !probe_possible());
+    return camera_found() && (settings_.fixed_camera || confirmed_camera_id_ == camera_id() || !probe_possible());
 }
 
 // VR needs the gameplay camera: a main menu's 3D background camera is found
@@ -139,7 +141,7 @@ void App::update_gameplay_probe(double now) {
         probed_camera_id_ = id;
         panel_dirty_ = true;
     }
-    if (!server_->active() || !camera_found() || !probe_possible()) return;
+    if (!server_->active() || !camera_found() || !probe_possible() || settings_.fixed_camera) return;
     if (calibrator_.gameplay_confirmed() && confirmed_camera_id_ != id) {
         confirmed_camera_id_ = id;
         VRL_LOG("compositor", "gameplay confirmed: %s", calibrator_.message().c_str());
@@ -153,6 +155,9 @@ void App::update_gameplay_probe(double now) {
     // In play, a confirmed camera is left alone (no surprise mouse nudges).
     if (confirmed && (phase_ == Phase::Playing || calibration_started_)) return;
     if (calibrator_.state() == MouseCalibrator::State::Failed && !calibrator_.gameplay_confirmed()) {
+        // A still camera that ignores input will not change its mind: do not
+        // keep nudging the game (fixed-camera games). Same in play: one try.
+        if (calibrator_.camera_static() || phase_ == Phase::Playing) return;
         if (probe_retry_at_ < 0) probe_retry_at_ = now + 4.0;
         if (now >= probe_retry_at_) calibration_started_ = false;  // try again (did you load a save?)
     }
@@ -165,6 +170,7 @@ void App::update_gameplay_probe(double now) {
 }
 
 bool App::aim_with_head() const {
+    if (settings_.hand_mouse != "off") return false;  // the mouse belongs to your hand
     if (settings_.aim == "head") return true;
     if (settings_.aim == "body") return false;
     return cpd_known() && uinput_ok_;
@@ -215,6 +221,12 @@ std::string App::status() const {
       << (settings_.mode == ViewMode::Vr && m != ViewMode::Vr ? " (vr unavailable: camera not found)" : "")
       << ", stereo: " << (frame_stereo_ ? "on" : "off");
     if (m == ViewMode::Vr) o << ", camera " << settings_.vr_camera << ", aim " << (aim_with_head() ? "head" : "body");
+    if (settings_.hand_mouse != "off")
+        o << "\nhand mouse: " << settings_.hand_mouse << " (" << settings_.hand_mouse_hand << " hand"
+          << (hand_cursor_valid_ ? ", cursor " + std::to_string(int(hand_cursor_u_ * 100)) + "%," +
+                                       std::to_string(int(hand_cursor_v_ * 100)) + "%"
+                                 : std::string(", not active")) << ")";
+    if (camera_found() && settings_.fixed_camera) o << "\nfixed camera: yes";
     o << "\ninput: " << settings_.scheme << (uinput_ok_ ? "" : " (no /dev/uinput access)")
       << ", hands " << (hands_.available() ? (hands_seen_ ? "tracked" : "available") : "unavailable")
       << ", controllers " << (controllers_seen_ ? "tracked" : "not seen") << "\n"
@@ -338,7 +350,15 @@ void App::enter_loading(bool restart_analysis) {
 }
 
 void App::start_playing(ViewMode choice, bool vouch) {
-    if (vouch && camera_found()) confirmed_camera_id_ = camera_id();
+    if (vouch && camera_found()) {
+        confirmed_camera_id_ = camera_id();
+        if (calibrator_.camera_static() && choice == ViewMode::Vr) {
+            // START on a still camera that ignores input: a fixed-camera game.
+            // Remember it so the next launch goes straight into VR.
+            settings_.fixed_camera = true;
+            fixed_camera_detected_ = true;
+        }
+    }
     // Detected values fill in whatever the profiles did not set.
     if (const AnalysisMsg* a = analysis()) {
         if ((a->flags & kAnalysisProjection) && !settings_.is_explicit("display.game_fov")) settings_.game_fov = a->hfov_deg;
@@ -379,6 +399,8 @@ void App::update_loading(double now) {
     in.calibration_from_profile = settings_.is_explicit("input.mouse_counts_per_degree");
     in.gameplay_confirmed = camera_found() && confirmed_camera_id_ == camera_id();
     in.probe_possible = probe_possible();
+    in.camera_static = calibrator_.camera_static();
+    in.fixed_camera = settings_.fixed_camera;
     in.uinput = uinput_ok_;
     in.hand_tracking = hands_.available();
     in.hands_visible = hands_.hand(0).valid || hands_.hand(1).valid;
@@ -476,7 +498,7 @@ void App::update_pointer(const XrInput::Result& in, bool trigger_left, bool trig
         }
     }
     if (!have) {
-        if (pointer_down_) pointer_.button(BTN_LEFT, false);
+        if (pointer_down_ && !hand_cursor_valid_) pointer_.button(BTN_LEFT, false);
         pointer_down_ = false;
         return;
     }
@@ -540,6 +562,70 @@ void App::update_pointer(const XrInput::Result& in, bool trigger_left, bool trig
     pointer_down_ = trigger && (pointer_down_ || pressed);
 }
 
+// Orientation in VR space that corresponds to the game's own camera when your
+// head is at rest: the recentered yaw, and the game camera's real pitch.
+Quat App::game_camera_rest() const {
+    return from_yaw_pitch(rad(base_yaw_), game_pitch_valid_ ? game_pitch_ : 0.0f);
+}
+
+// The game moves something (a hand, a tool, a cursor) with the mouse, seen
+// through its fixed camera. Put the cursor where your real hand appears
+// through that camera: the in-game hand then sits under your real one.
+// Projection uses the game's own camera at rest (rest pose), not the
+// head-injected one: the game raycasts the cursor with its CPU camera.
+void App::update_hand_mouse(const XrInput::Result& in, GamepadState* pad) {
+    const AnalysisMsg* a = analysis();
+    if (!a || !(a->flags & kAnalysisProjection) || !uinput_ok_) return;
+    const int h = settings_.hand_mouse_hand == "left" ? 0 : 1;
+    Vec3 tip;
+    bool click = false, rclick = false;
+    if (in.aim_valid[h]) {
+        const Vec3 o = to_vec(in.aim[h].position);
+        const Vec3 d = rotate(to_quat(in.aim[h].orientation), {0, 0, -1});
+        tip = add(o, scale(d, settings_.hand_mouse_offset));
+        float& trig = h == 1 ? pad->rt : pad->lt;
+        bool& grip = h == 1 ? pad->rb : pad->lb;
+        click = trig > 0.5f;
+        rclick = grip;
+        trig = 0;  // these buttons now belong to the mouse
+        grip = false;
+    } else if (settings_.hand_tracking && hands_.hand(h).valid) {
+        const HandTracking::Hand& hand = hands_.hand(h);
+        tip = to_vec(hand.joints[XR_HAND_JOINT_INDEX_TIP_EXT].pose.position);
+        click = hand.index_pinch;
+        rclick = hand.middle_pinch;
+    } else {
+        return;
+    }
+    float u, v;
+    if (!project_to_screen(tip, rest_pos_, game_camera_rest(), rad(a->hfov_deg), rad(a->vfov_deg), &u, &v)) return;
+    u = std::fmin(std::fmax(u, 0.0f), 1.0f);
+    v = std::fmin(std::fmax(v, 0.0f), 1.0f);
+    hand_cursor_valid_ = true;
+    hand_cursor_ = tip;
+    hand_cursor_u_ = u;
+    hand_cursor_v_ = v;
+
+    auto buttons = [&](auto& dev) {
+        if (click != hand_click_) dev.button(BTN_LEFT, click);
+        if (rclick != hand_rclick_) dev.button(BTN_RIGHT, rclick);
+    };
+    if (settings_.hand_mouse == "absolute") {
+        if (!pointer_.is_open() && !pointer_.open()) return;
+        pointer_.move_to(u, v);
+        buttons(pointer_);
+    } else {
+        if (!mouse_.is_open() && !mouse_.open()) return;
+        int dx, dy;
+        const float w = frame_w_ ? float(frame_w_) : 1920.0f, hh = frame_h_ ? float(frame_h_) : 1080.0f;
+        rel_cursor_.step(u * w, v * hh, std::fmax(settings_.hand_mouse_counts_per_pixel, 0.01f), &dx, &dy);
+        mouse_.move(dx, dy);
+        buttons(mouse_);
+    }
+    hand_click_ = click;
+    hand_rclick_ = rclick;
+}
+
 void App::update_input(double now, float dt, bool head_ok, XrTime time) {
     const bool game = server_->active() != nullptr;
     XrInput::Result in = input_.sync(xr_.session(), dt, xr_.local_space(), time);
@@ -572,6 +658,10 @@ void App::update_input(double now, float dt, bool head_ok, XrTime time) {
 
     // Game controls.
     const bool kbm = settings_.scheme == "keyboard_mouse";
+    hand_cursor_valid_ = false;
+    if (phase_ == Phase::Playing && effective_mode() == ViewMode::Vr && settings_.hand_mouse != "off")
+        update_hand_mouse(in, &pad);
+
     // The gameplay probe may hold the right stick for a moment.
     const bool probe_stick = calibrator_.busy() && calibrator_.stick_x() != 0.0f;
     if (probe_stick) pad.rx = calibrator_.stick_x();
@@ -645,7 +735,7 @@ void App::update_camera_injection(bool head_ok) {
     // The game camera's own orientation in VR space: with head aiming it
     // follows the counts we sent through the mouse, otherwise it is the
     // rest orientation captured at recenter.
-    Quat cam_world = rest_rot_;
+    Quat cam_world = game_camera_rest();
     if (aim_with_head() && head_mouse_.active())
         cam_world = from_yaw_pitch(rad(base_yaw_ + head_mouse_.camera_yaw()), rad(base_pitch_ + head_mouse_.camera_pitch()));
     const Quat inv = conjugate(cam_world);
@@ -672,6 +762,12 @@ void App::update_camera_injection(bool head_ok) {
 
 // Called for every new game frame, before it is rendered.
 void App::on_game_frame(double now, const FrameView& f) {
+    if (f.camera_valid) {
+        if (const AnalysisMsg* a = analysis()) {
+            game_pitch_ = camera_pitch(f.cam_rot, a->basis_up, a->basis_fwd);
+            game_pitch_valid_ = true;
+        }
+    }
     if (calibrator_.busy()) {
         int counts = calibrator_.update(now, f.camera_valid, f.cam_rot);
         if (counts) mouse_.move(counts, 0);
@@ -689,7 +785,8 @@ void App::on_game_frame(double now, const FrameView& f) {
                 break;
             }
         if (!found) {  // not injected: the game's own camera, at the rest pose
-            head.orientation = {rest_rot_.x, rest_rot_.y, rest_rot_.z, rest_rot_.w};
+            const Quat g = game_camera_rest();
+            head.orientation = {g.x, g.y, g.z, g.w};
             head.position = {rest_pos_.x, rest_pos_.y, rest_pos_.z};
         }
         const Quat q = to_quat(head.orientation);
@@ -768,6 +865,9 @@ int App::run() {
         pose_history_.clear();
         confirmed_camera_id_ = 0;
         cpd_measured_ = false;
+        fixed_camera_detected_ = false;
+        rel_cursor_ = RelativeCursor{};
+        game_pitch_valid_ = false;
         reset_probe();
         if (!c || settings_.loading) {
             enter_loading(false);

@@ -86,7 +86,10 @@ LoadingView build_loading_view(const LoadingInputs& in, const Settings& s, doubl
     //    3D background (or a cutscene) has a camera too, but it ignores you.
     LoadingView::Item g{"Gameplay", "", C::Pending};
     const bool mouse_ok = in.calibration == MouseCalibrator::State::Done || in.calibration_from_profile;
-    if (!in.probe_possible) {
+    if (in.fixed_camera && view) {
+        g.state = C::Ok;
+        g.detail = "fixed-camera game (saved): your head moves the view";
+    } else if (!in.probe_possible) {
         g.state = C::Warn;
         g.detail = !in.uinput ? "can't check (no /dev/uinput): press START once you are in the game"
                               : "check disabled: press START once you are in the game";
@@ -97,6 +100,9 @@ LoadingView build_loading_view(const LoadingInputs& in, const Settings& s, doubl
         else g.detail = in.calibration_message.empty() ? "camera follows your controls" : in.calibration_message;
     } else if (!view) {
         g.detail = "needs the camera position";
+    } else if (in.calibration == MouseCalibrator::State::Failed && in.camera_static) {
+        g.state = C::Warn;
+        g.detail = "still camera that ignores mouse and stick: table game? START = VR";
     } else if (in.calibration == MouseCalibrator::State::Failed) {
         g.state = C::Active;
         g.detail = "this camera ignores your controls: main menu or cutscene? (retrying)";
@@ -134,7 +140,7 @@ LoadingView build_loading_view(const LoadingInputs& in, const Settings& s, doubl
     for (auto& it : v.items) done += (it.state == C::Ok || it.state == C::Warn) ? 1 : 0;
     v.progress = float(done) / float(v.items.size());
     const bool timed_out = in.elapsed >= double(s.loading_timeout);
-    const bool confirmed = in.gameplay_confirmed && proj;
+    const bool confirmed = (in.gameplay_confirmed || (in.fixed_camera && view)) && proj;
     v.ready = confirmed || timed_out;
     v.auto_mode = confirmed ? v.recommended : ViewMode::Theater;
     if (!confirmed && timed_out) v.recommended_text += " - auto start: theater (gameplay not confirmed)";
@@ -143,6 +149,8 @@ LoadingView build_loading_view(const LoadingInputs& in, const Settings& s, doubl
                          !in.gameplay_confirmed;
     if (!proj && !timed_out)
         v.hint = "Load a save / enter gameplay - the 3D camera can only be found while the game renders it.";
+    else if (proj && !confirmed && in.camera_static)
+        v.hint = "Fixed camera (you control a hand, not the view)? START: VR, remembered.";
     else if (proj && in.probe_possible && !in.gameplay_confirmed && probing)
         v.hint = "Stand still in game and leave the mouse alone for a moment.";
     else if (proj && in.probe_possible && !in.gameplay_confirmed)

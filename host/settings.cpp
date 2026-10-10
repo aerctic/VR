@@ -45,6 +45,8 @@ const std::vector<Field>& fields() {
         F("vr.aim", String, aim),
         F("vr.snap_turn", Float, snap_turn),
         F("vr.turn_speed", Float, turn_speed),
+        F("vr.fixed_camera", Bool, fixed_camera),
+        F("vr.show_room", Bool, show_room),
         F("loading.enabled", Bool, loading),
         F("loading.auto_continue", Bool, auto_continue),
         F("loading.timeout", Float, loading_timeout),
@@ -57,6 +59,10 @@ const std::vector<Field>& fields() {
         F("input.scheme", String, scheme),
         F("input.pointer", Bool, pointer),
         F("input.hand_tracking", Bool, hand_tracking),
+        F("input.hand_mouse", String, hand_mouse),
+        F("input.hand_mouse_hand", String, hand_mouse_hand),
+        F("input.hand_mouse_offset", Float, hand_mouse_offset),
+        F("input.hand_mouse_counts_per_pixel", Float, hand_mouse_counts_per_pixel),
     };
     return f;
 }
@@ -79,6 +85,8 @@ static bool valid_choice(const std::string& key, const std::string& v) {
         {"vr.camera", {"head", "alternate"}},
         {"vr.aim", {"auto", "head", "body"}},
         {"input.scheme", {"gamepad", "keyboard_mouse"}},
+        {"input.hand_mouse", {"off", "absolute", "relative"}},
+        {"input.hand_mouse_hand", {"right", "left"}},
     };
     auto it = choices.find(key);
     return it == choices.end() || it->second.count(v) != 0;

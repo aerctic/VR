@@ -52,6 +52,8 @@ private:
     void recenter(const XrPosef& head);
     void update_input(double now, float dt, bool head_ok, XrTime time);
     void update_pointer(const XrInput::Result& in, bool trigger_left, bool trigger_right);
+    // input.hand_mouse: the game's mouse cursor follows your hand (VR mode).
+    void update_hand_mouse(const XrInput::Result& in, GamepadState* pad);
     void update_camera_injection(bool head_ok);
     void on_game_frame(double now, const FrameView& f);
     bool vr_available() const;
@@ -105,6 +107,19 @@ private:
     uint32_t confirmed_camera_id_ = 0;  // camera known to follow the player
     double probe_retry_at_ = -1;
     bool cpd_measured_ = false;         // mouse_counts_per_degree came from a calibration
+    bool fixed_camera_detected_ = false;
+    // Pitch of the game's own camera (from the tracked camera). The VR rest
+    // view is aligned to it so the game's horizon stays level.
+    bool game_pitch_valid_ = false;
+    float game_pitch_ = 0;
+    Quat game_camera_rest() const;  // START pressed on a still camera that ignores input
+
+    // Hand mouse.
+    bool hand_cursor_valid_ = false;
+    Vec3 hand_cursor_;
+    float hand_cursor_u_ = 0.5f, hand_cursor_v_ = 0.5f;
+    bool hand_click_ = false, hand_rclick_ = false;
+    RelativeCursor rel_cursor_;
     LoadingView loading_view_;
     bool panel_dirty_ = true;
     double panel_drawn_at_ = -1;

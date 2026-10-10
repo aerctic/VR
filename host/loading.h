@@ -27,6 +27,8 @@ struct LoadingInputs {
     bool calibration_from_profile = false;  // mouse counts per degree come from a profile
     bool gameplay_confirmed = false;        // the current camera follows player input
     bool probe_possible = false;            // we can send input to check that (uinput + enabled)
+    bool camera_static = false;             // probe: still camera that ignores input (fixed-camera game?)
+    bool fixed_camera = false;              // profile says this game has a fixed camera
     bool uinput = false;           // virtual mouse / gamepad possible
     bool hand_tracking = false;    // runtime offers XR_EXT_hand_tracking
     bool hands_visible = false;
